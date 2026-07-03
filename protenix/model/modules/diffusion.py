@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import time
 from typing import Optional, Union
 
 import torch
@@ -26,6 +29,15 @@ from protenix.model.modules.transformer import (
 )
 from protenix.model.triangular.layers import LayerNorm
 from protenix.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
+
+
+def _diffusion_profile_path() -> Optional[str]:
+    return os.environ.get("DIFFUSION_PROFILE_LOG")
+
+
+def _diffusion_sync_if_needed(enabled: bool, ref: torch.Tensor) -> None:
+    if enabled and ref.is_cuda:
+        torch.cuda.synchronize(ref.device)
 
 
 class DiffusionConditioning(nn.Module):
@@ -371,6 +383,22 @@ class DiffusionModule(nn.Module):
         """
         N_sample = r_noisy.size(-3)
         assert t_hat_noise_level.size(-1) == N_sample
+        profile_enabled = _diffusion_profile_path() is not None
+        profile_timings_ms: dict[str, float] = {}
+
+        _diffusion_sync_if_needed(profile_enabled, r_noisy)
+        profile_last = time.perf_counter()
+
+        def mark_profile(name: str, ref: torch.Tensor = r_noisy) -> None:
+            nonlocal profile_last
+            if not profile_enabled:
+                return
+            _diffusion_sync_if_needed(True, ref)
+            now = time.perf_counter()
+            profile_timings_ms[name] = (
+                profile_timings_ms.get(name, 0.0) + (now - profile_last) * 1000.0
+            )
+            profile_last = now
 
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled():
@@ -402,12 +430,14 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 use_conditioning=use_conditioning,
             )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
+        mark_profile("diffusion_conditioning", z_pair)
 
         # Expand embeddings to match N_sample
         s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)  # [..., N_sample, N_token, c_s]
         z_pair = expand_at_dim(
             z_pair, dim=-4, n=1
         )  # [..., N_sample, N_token, N_token, c_z]
+        mark_profile("expand_embeddings", z_pair)
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
@@ -450,6 +480,7 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+        mark_profile("atom_attention_encoder", a_token)
         # Upcast
         a_token = a_token.to(dtype=torch.float32)
 
@@ -467,6 +498,7 @@ class DiffusionModule(nn.Module):
             z = permute_final_dims(z, [2, 0, 1]).contiguous()
         else:
             z = z_pair.to(dtype=torch.float32)
+        mark_profile("token_z_prepare", z)
         a_token = self.diffusion_transformer(
             a=a_token.to(dtype=torch.float32),  # Upcast all inputs
             s=s_single.to(dtype=torch.float32),
@@ -475,8 +507,10 @@ class DiffusionModule(nn.Module):
             chunk_size=chunk_size,
             enable_efficient_fusion=enable_efficient_fusion,
         )
+        mark_profile("diffusion_transformer", a_token)
 
         a_token = self.layernorm_a(a_token)
+        mark_profile("layernorm_a", a_token)
 
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
@@ -502,8 +536,9 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+        mark_profile("atom_attention_decoder", r_update)
 
-        return r_update
+        return r_update, profile_timings_ms
 
     def forward(
         self,
@@ -550,6 +585,48 @@ class DiffusionModule(nn.Module):
             torch.Tensor: the denoised coordinates of x
                 [..., N_sample, N_atom,3]
         """
+        profile_log = _diffusion_profile_path()
+        profile_enabled = profile_log is not None
+        profile_timings_ms: dict[str, float] = {}
+
+        _diffusion_sync_if_needed(profile_enabled, x_noisy)
+        profile_last = time.perf_counter()
+
+        def mark_profile(name: str, ref: torch.Tensor = x_noisy) -> None:
+            nonlocal profile_last
+            if not profile_enabled:
+                return
+            _diffusion_sync_if_needed(True, ref)
+            now = time.perf_counter()
+            profile_timings_ms[name] = (
+                profile_timings_ms.get(name, 0.0) + (now - profile_last) * 1000.0
+            )
+            profile_last = now
+
+        def write_profile(ref: torch.Tensor) -> None:
+            if not profile_enabled:
+                return
+            _diffusion_sync_if_needed(True, ref)
+            payload = {
+                "path": "diffusion_module_forward",
+                "x_noisy_shape": [int(dim) for dim in x_noisy.shape],
+                "t_shape": [int(dim) for dim in t_hat_noise_level.shape],
+                "dtype": str(x_noisy.dtype),
+                "device": str(x_noisy.device),
+                "n_sample": int(x_noisy.size(-3)),
+                "n_atom": int(x_noisy.size(-2)),
+                "n_token": int(s_inputs.size(-2)),
+                "chunk_size": None if chunk_size is None else int(chunk_size),
+                "enable_efficient_fusion": bool(enable_efficient_fusion),
+                "timings_ms": profile_timings_ms,
+                "total_ms": float(sum(profile_timings_ms.values())),
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+
         # Scale positions to dimensionless vectors with approximately unit variance
         # As in EDM:
         #     r_noisy = (c_in * x_noisy)
@@ -558,11 +635,12 @@ class DiffusionModule(nn.Module):
             x_noisy
             / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
         )
+        mark_profile("scale_positions", r_noisy)
 
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
         #     r_update = F(r_noisy, c_noise(sigma))
-        r_update = self.f_forward(
+        r_update, f_timings_ms = self.f_forward(
             r_noisy=r_noisy,
             t_hat_noise_level=t_hat_noise_level,
             input_feature_dict=input_feature_dict,
@@ -577,6 +655,17 @@ class DiffusionModule(nn.Module):
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
         )
+        if profile_enabled:
+            _diffusion_sync_if_needed(True, r_update)
+            now = time.perf_counter()
+            f_forward_elapsed_ms = (now - profile_last) * 1000.0
+            profile_last = now
+            f_forward_internal_ms = sum(f_timings_ms.values())
+            overhead_ms = max(0.0, f_forward_elapsed_ms - f_forward_internal_ms)
+            if overhead_ms:
+                profile_timings_ms["f_forward_overhead"] = overhead_ms
+        for name, value in f_timings_ms.items():
+            profile_timings_ms[name] = profile_timings_ms.get(name, 0.0) + value
 
         # Rescale updates to positions and combine with input positions
         # As in EDM:
@@ -596,5 +685,7 @@ class DiffusionModule(nn.Module):
             / torch.sqrt(1 + s_ratio**2)
             * r_update
         ).to(r_update.dtype)
+        mark_profile("rescale_update", x_denoised)
+        write_profile(x_denoised)
 
         return x_denoised

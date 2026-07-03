@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import json
+import os
 import random
 import time
 from typing import Any, Optional
@@ -50,6 +52,22 @@ from protenix.utils.permutation.permutation import SymmetricPermutation
 from protenix.utils.torch_utils import autocasting_disable_decorator
 
 logger = get_logger(__name__)
+
+
+def _protenix_profile_path() -> Optional[str]:
+    return os.environ.get("PROTENIX_PROFILE_LOG")
+
+
+def _profile_ref_tensor(input_feature_dict: dict[str, Any]) -> Optional[torch.Tensor]:
+    for value in input_feature_dict.values():
+        if isinstance(value, torch.Tensor) and value.is_cuda:
+            return value
+    return None
+
+
+def _protenix_sync_if_needed(enabled: bool, ref: Optional[torch.Tensor]) -> None:
+    if enabled and ref is not None and ref.is_cuda:
+        torch.cuda.synchronize(ref.device)
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -487,6 +505,47 @@ class Protenix(nn.Module):
         """
         step_st = time.time()
         N_token = input_feature_dict["residue_index"].shape[-1]
+        profile_log = _protenix_profile_path()
+        profile_enabled = profile_log is not None
+        profile_ref = _profile_ref_tensor(input_feature_dict)
+        profile_timings_ms: dict[str, float] = {}
+
+        _protenix_sync_if_needed(profile_enabled, profile_ref)
+        profile_last = time.perf_counter()
+
+        def mark_profile(name: str, ref: Optional[torch.Tensor] = None) -> None:
+            nonlocal profile_last, profile_ref
+            if not profile_enabled:
+                return
+            if ref is not None:
+                profile_ref = ref
+            _protenix_sync_if_needed(True, profile_ref)
+            now = time.perf_counter()
+            profile_timings_ms[name] = (
+                profile_timings_ms.get(name, 0.0) + (now - profile_last) * 1000.0
+            )
+            profile_last = now
+
+        def write_profile() -> None:
+            if not profile_enabled:
+                return
+            payload = {
+                "path": "protenix_main_inference_loop",
+                "n_token": int(N_token),
+                "mode": mode,
+                "n_cycle": int(N_cycle),
+                "inplace_safe": bool(inplace_safe),
+                "chunk_size": None if chunk_size is None else int(chunk_size),
+                "triangle_multiplicative": self.configs.triangle_multiplicative,
+                "triangle_attention": self.configs.triangle_attention,
+                "timings_ms": profile_timings_ms,
+                "total_ms": float(sum(profile_timings_ms.values())),
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
 
         # Apply dynamic chunk_size if enabled (otherwise keep the passed chunk_size)
         if (
@@ -507,6 +566,7 @@ class Protenix(nn.Module):
             chunk_size=chunk_size,
             mc_dropout=mc_dropout,
         )
+        mark_profile("get_pairformer_output", z)
 
         keys_to_delete = []
         for key in input_feature_dict.keys():
@@ -522,6 +582,7 @@ class Protenix(nn.Module):
 
         for key in keys_to_delete:
             del input_feature_dict[key]
+        mark_profile("cleanup_input_features", z)
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
         # Sample diffusion
@@ -559,6 +620,7 @@ class Protenix(nn.Module):
         else:
             cache["pair_z"] = None
             cache["p_lm/c_l"] = [None, None]
+        mark_profile("diffusion_cache_prepare", s_inputs)
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -573,6 +635,7 @@ class Protenix(nn.Module):
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
         )
+        mark_profile("sample_diffusion", pred_dict["coordinate"])
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
@@ -583,6 +646,7 @@ class Protenix(nn.Module):
             distogram_logits=self.distogram_head(z),
             **sample_confidence.get_bin_params(self.configs.loss.distogram),
         )  # [N_token, N_token]
+        mark_profile("distogram_contact_probs", pred_dict["contact_probs"])
 
         # Confidence logits
         (
@@ -602,6 +666,7 @@ class Protenix(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
+        mark_profile("confidence_head", pred_dict["plddt"])
 
         step_confidence = time.time()
         time_tracker.update({"confidence": step_confidence - step_diffusion})
@@ -618,6 +683,7 @@ class Protenix(nn.Module):
             )
             last_step_seconds = step_confidence
             time_tracker.update({"permutation": time.time() - last_step_seconds})
+            mark_profile("permutation", pred_dict["coordinate"])
 
         # Summary Confidence & Full Data
         # Computed after coordinates and logits are permuted
@@ -651,6 +717,8 @@ class Protenix(nn.Module):
                 input_feature_dict["ref_element"] if mode != "inference" else None
             ),
         )
+        mark_profile("summary_confidence", pred_dict["coordinate"])
+        write_profile()
 
         return pred_dict, log_dict, time_tracker
 

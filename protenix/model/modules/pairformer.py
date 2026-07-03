@@ -238,9 +238,10 @@ class PairformerBlock(nn.Module):
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         """Experimental 4-GPU row-parallel z-triangle path.
 
-        This path intentionally covers only the z-heavy triangle subgraph. It
-        all-gathers full z after each residual-producing triangle module, then
-        runs pair_transition and optional s updates replicated on every rank.
+        This path intentionally covers the z-heavy triangle subgraph and the
+        row-local pair transition. It all-gathers full z after each
+        residual-producing module, then runs optional s updates replicated on
+        every rank.
         """
         squeeze_batch = z.dim() == 3
         if squeeze_batch:
@@ -253,36 +254,93 @@ class PairformerBlock(nn.Module):
         if pair_mask is None:
             pair_mask = z.new_ones(z.shape[:-1])
 
+        profile_log = _pairformer_profile_path()
+        profile_enabled = profile_log is not None
+        timings_ms: dict[str, float] = {}
+
+        _pairformer_sync_if_needed(profile_enabled, z)
+        t_last = time.perf_counter()
+
+        def mark_profile(name: str, ref: torch.Tensor = z) -> None:
+            nonlocal t_last
+            if not profile_enabled:
+                return
+            _pairformer_sync_if_needed(True, ref)
+            now = time.perf_counter()
+            timings_ms[name] = timings_ms.get(name, 0.0) + (now - t_last) * 1000.0
+            t_last = now
+
+        def gather_profile(local: torch.Tensor, name: str) -> torch.Tensor:
+            gathered = _pairformer_gather_rows(local, n, world)
+            mark_profile(name, gathered)
+            return gathered
+
+        def write_profile(ref: torch.Tensor) -> None:
+            if not profile_enabled:
+                return
+            _pairformer_sync_if_needed(True, ref)
+            payload = {
+                "path": "pairformer_block_row_parallel",
+                "block_index": int(self.profile_block_index),
+                "rank": int(rank),
+                "world": int(world),
+                "rows": int(rows),
+                "shape_s": None if s is None else [int(dim) for dim in s.shape],
+                "shape_z": [int(dim) for dim in z.shape],
+                "dtype_s": None if s is None else str(s.dtype),
+                "dtype_z": str(z.dtype),
+                "device": str(z.device),
+                "timings_ms": timings_ms,
+                "total_ms": float(sum(timings_ms.values())),
+                "triangle_attention": "wmma",
+                "triangle_multiplicative": "torch",
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+
         update = _pairformer_trimul_update_rows(
             self.tri_mul_out, z, pair_mask, start, end
         )
+        mark_profile("tri_mul_out_compute", update)
         local = _pairformer_pad_rows(z[:, start:end] + update, rows)
-        z = _pairformer_gather_rows(local, n, world)
+        z = gather_profile(local, "tri_mul_out_gather")
 
         update = _pairformer_trimul_update_rows(
             self.tri_mul_in, z, pair_mask, start, end
         )
+        mark_profile("tri_mul_in_compute", update)
         local = _pairformer_pad_rows(z[:, start:end] + update, rows)
-        z = _pairformer_gather_rows(local, n, world)
+        z = gather_profile(local, "tri_mul_in_gather")
 
         local_z = _pairformer_pad_rows(z[:, start:end], rows)
         local_mask = _pairformer_pad_rows(pair_mask[:, start:end].unsqueeze(-1), rows).squeeze(-1)
         local_update = _pairformer_triangle_attention_shard(
             self.tri_att_start, local_z, local_mask
         )
-        z = _pairformer_gather_rows(local_z + local_update, n, world)
+        mark_profile("tri_att_start_compute", local_update)
+        z = gather_profile(local_z + local_update, "tri_att_start_gather")
 
         z = z.transpose(-2, -3).contiguous()
+        mark_profile("transpose_after_start", z)
         mask_t = pair_mask.transpose(-1, -2).contiguous()
         local_z = _pairformer_pad_rows(z[:, start:end], rows)
         local_mask = _pairformer_pad_rows(mask_t[:, start:end].unsqueeze(-1), rows).squeeze(-1)
         local_update = _pairformer_triangle_attention_shard(
             self.tri_att_end, local_z, local_mask
         )
-        z = _pairformer_gather_rows(local_z + local_update, n, world)
+        mark_profile("tri_att_end_compute", local_update)
+        z = gather_profile(local_z + local_update, "tri_att_end_gather")
         z = z.transpose(-2, -3).contiguous()
+        mark_profile("transpose_after_end", z)
 
-        z = z + self.pair_transition(z)
+        local_z = z[:, start:end]
+        local_update = self.pair_transition(local_z)
+        mark_profile("pair_transition_compute", local_update)
+        local = _pairformer_pad_rows(local_z + local_update, rows)
+        z = gather_profile(local, "pair_transition_gather")
 
         if squeeze_batch:
             z = z.squeeze(0)
@@ -290,7 +348,10 @@ class PairformerBlock(nn.Module):
 
         if self.c_s > 0:
             s = s + self.attention_pair_bias(a=s, s=None, z=z)
+            mark_profile("attention_pair_bias_add", s)
             s = s + self.single_transition(s)
+            mark_profile("single_transition_add", s)
+        write_profile(z)
         return s, z
 
     def forward(

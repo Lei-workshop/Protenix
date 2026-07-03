@@ -15,6 +15,8 @@
 
 import math
 import os
+import json
+import time
 from functools import partial, partialmethod
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -279,19 +281,53 @@ def _attention(
     value: torch.Tensor,
     biases: List[torch.Tensor],
 ) -> torch.Tensor:
+    profile_log = os.environ.get("TRIATT_PROFILE_LOG")
+    profile = bool(profile_log)
+    timings = {}
+    if profile:
+        torch.cuda.synchronize()
+    t_last = time.perf_counter()
+
+    def mark(name):
+        nonlocal t_last
+        if not profile:
+            return
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        timings[name] = (now - t_last) * 1000.0
+        t_last = now
+
     # [*, H, C_hidden, K]
     key = permute_final_dims(key, (1, 0))
+    mark("key_permute")
 
     # [*, H, Q, K]
     a = torch.matmul(query, key)
+    mark("qk_matmul")
 
     for b in biases:
         a += b
+    mark("bias_add")
 
     a = softmax_no_cast(a, -1)
+    mark("softmax")
 
     # [*, H, Q, C_hidden]
     a = torch.matmul(a, value)
+    mark("av_matmul")
+
+    if profile:
+        record = {
+            "path": "torch",
+            "shape": list(query.shape),
+            "dtype": str(query.dtype),
+            "q_stride": list(query.stride()),
+            "bias_shapes": [list(b.shape) for b in biases],
+            "timings_ms": timings,
+            "total_ms": sum(timings.values()),
+        }
+        with open(profile_log, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     return a
 
@@ -417,6 +453,7 @@ class Attention(nn.Module):
                 - "triattention": Optimized tri-attention module
                 - "deepspeed": DeepSpeed's fused attention kernel
                 - "cuequivariance": nvidia cuequivariance attention kernel
+                - "wmma": MetaX C500 WMMA triangle attention kernel
         Returns
             [*, Q, C_q] attention update
         """
@@ -425,6 +462,7 @@ class Attention(nn.Module):
             "deepspeed",
             "triattention",
             "cuequivariance",
+            "wmma",
         ]
 
         if biases is None:
@@ -432,7 +470,9 @@ class Attention(nn.Module):
 
         # DeepSpeed attention kernel applies scaling internally
         q, k, v = self._prep_qkv(
-            q_x, kv_x, apply_scale=triangle_attention in ["torch", "triattention"]
+            q_x,
+            kv_x,
+            apply_scale=triangle_attention in ["torch", "triattention", "wmma"],
         )
 
         if q.shape[-2] <= 16:
@@ -447,6 +487,8 @@ class Attention(nn.Module):
             o = _deepspeed_evo_attn(q, k, v, biases)
         elif triangle_attention == "triattention":
             o = _tri_attention(q, k, v, biases)
+        elif triangle_attention == "wmma":
+            o = _wmma_tri_attention(q, k, v, biases)
         elif triangle_attention == "cuequivariance":
             # Notes:
             #     (1) Context is saved for backward pass. You don't need to save it manually.
@@ -578,6 +620,41 @@ def _tri_attention(
         v = reshape_dims(v)
         biases = [reshape_dims(b) for b in biases]
     o = TriAttentionFunction.apply(q, k, v, biases[0], biases[1])
+
+    o = o.reshape(orig_shape)
+    return o
+
+
+@torch.jit.ignore
+def _wmma_tri_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    biases: List[torch.Tensor],
+) -> torch.Tensor:
+    """Compute triangle attention using the MetaX C500 WMMA kernel."""
+    from wmma_attention import WMMATriAttentionFunction
+
+    def reshape_dims(x: torch.Tensor) -> torch.Tensor:
+        no_batch_dims = len(x.shape[:-3])
+        if no_batch_dims < 2:
+            return x.reshape(*((1,) * (2 - no_batch_dims) + x.shape))
+        if no_batch_dims > 2:
+            return x.reshape(*((x.shape[0], -1) + x.shape[-3:]))
+        return x
+
+    # [*, Q/K, H, C_hidden]
+    q = q.transpose(-2, -3)
+    k = k.transpose(-2, -3)
+    v = v.transpose(-2, -3)
+
+    orig_shape = q.shape
+    if len(orig_shape[:-3]) != 2:
+        q = reshape_dims(q)
+        k = reshape_dims(k)
+        v = reshape_dims(v)
+        biases = [reshape_dims(b) for b in biases]
+    o = WMMATriAttentionFunction.apply(q, k, v, biases[0], biases[1])
 
     o = o.reshape(orig_shape)
     return o

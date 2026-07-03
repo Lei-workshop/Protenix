@@ -431,41 +431,73 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         runner (InferenceRunner): The initialized runner instance.
         configs (Any): Inference configurations.
     """
-    # Data loading
-    logger.info(f"Loading data from {configs.input_json_path}")
-    with open(configs.input_json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
+    broadcast_data = (
+        os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
+        and DIST_WRAPPER.world_size > 1
+        and dist.is_initialized()
+    )
 
-    if not isinstance(json_data, list) or len(json_data) == 0:
-        raise ValueError(
-            f"Input JSON must be a non-empty top-level list, got {type(json_data).__name__} "
-            f"from {configs.input_json_path}"
-        )
+    dataloader = None
+    seeds = None
+    num_data = 0
+    if (not broadcast_data) or DIST_WRAPPER.rank == 0:
+        # Data loading
+        logger.info(f"Loading data from {configs.input_json_path}")
+        with open(configs.input_json_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
 
-    seed_in_json = json_data[0].get("modelSeeds")
-    if seed_in_json and configs.use_seeds_in_json:
-        seeds = [int(i) for i in seed_in_json]
-        logger.info(f"Using seeds from JSON: {seeds}")
-    else:
-        seeds = configs.seeds
+        if not isinstance(json_data, list) or len(json_data) == 0:
+            raise ValueError(
+                f"Input JSON must be a non-empty top-level list, got {type(json_data).__name__} "
+                f"from {configs.input_json_path}"
+            )
 
-    try:
-        dataloader = get_inference_dataloader(configs=configs)
-    except Exception as e:
-        error_message = (
-            f"Dataloader initialization failed: {e}\n{traceback.format_exc()}"
-        )
-        logger.error(error_message)
-        with open(opjoin(runner.error_dir, "error.txt"), "a", encoding="utf-8") as f:
-            f.write(error_message)
-        return
+        seed_in_json = json_data[0].get("modelSeeds")
+        if seed_in_json and configs.use_seeds_in_json:
+            seeds = [int(i) for i in seed_in_json]
+            logger.info(f"Using seeds from JSON: {seeds}")
+        else:
+            seeds = configs.seeds
 
-    num_data = len(dataloader.dataset)
+        try:
+            dataloader = get_inference_dataloader(configs=configs)
+        except Exception as e:
+            error_message = (
+                f"Dataloader initialization failed: {e}\n{traceback.format_exc()}"
+            )
+            logger.error(error_message)
+            with open(opjoin(runner.error_dir, "error.txt"), "a", encoding="utf-8") as f:
+                f.write(error_message)
+            return
+
+        num_data = len(dataloader.dataset)
+
+    if broadcast_data:
+        meta = [seeds, num_data] if DIST_WRAPPER.rank == 0 else [None, None]
+        dist.broadcast_object_list(meta, src=0)
+        seeds, num_data = meta
+        if DIST_WRAPPER.rank != 0:
+            logger.info(
+                f"[Rank {DIST_WRAPPER.rank}] Received distributed inference metadata: "
+                f"num_data={num_data}, seeds={seeds}"
+            )
+
     t0_start = time.time()
     for seed in seeds:
         seed_everything(seed=seed, deterministic=configs.deterministic)
         t1_start = time.time()
-        for batch in dataloader:
+        data_iter = iter(dataloader) if dataloader is not None else None
+        for batch_idx in range(num_data):
+            if broadcast_data:
+                if DIST_WRAPPER.rank == 0:
+                    batch = next(data_iter)
+                    batch_obj = [batch]
+                else:
+                    batch_obj = [None]
+                dist.broadcast_object_list(batch_obj, src=0)
+                batch = batch_obj[0]
+            else:
+                batch = next(data_iter)
             sample_name = "unknown"
             try:
                 t2_start = time.time()
@@ -490,6 +522,17 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 )
                 new_configs = update_inference_configs(configs, data["N_token"].item())
                 runner.update_model_configs(new_configs)
+                if (
+                    os.environ.get("PROTENIX_DISTRIBUTED_FORWARD_BARRIER", "0") == "1"
+                    and DIST_WRAPPER.world_size > 1
+                    and dist.is_initialized()
+                ):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    dist.barrier()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t2_start = time.time()
                 prediction = runner.predict(data)
                 if (
                     not _pairformer_row_parallel_inference_enabled()

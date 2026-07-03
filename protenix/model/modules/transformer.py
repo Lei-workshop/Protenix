@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import time
 from functools import partial
 from typing import Callable, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -35,6 +39,114 @@ from protenix.model.utils import (
     checkpoint_blocks,
     permute_final_dims,
 )
+
+
+def _diffusion_transformer_profile_path() -> Optional[str]:
+    return os.environ.get("DIFFUSION_TRANSFORMER_PROFILE_LOG")
+
+
+def _diffusion_transformer_sync_if_needed(enabled: bool, ref: torch.Tensor) -> None:
+    if enabled and ref.is_cuda:
+        torch.cuda.synchronize(ref.device)
+
+
+def _diffusion_ulysses_enabled() -> bool:
+    return os.environ.get("PROTENIX_DIFFUSION_ULYSSES_SP", "0") == "1"
+
+
+def _diffusion_ulysses_init_if_needed(ref: torch.Tensor) -> bool:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if ref.device.type == "cuda":
+        torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        try:
+            dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+        except TypeError:
+            dist.init_process_group("nccl")
+    return True
+
+
+def _sp_row_bounds(n: int, world: int, rank: int) -> tuple[int, int, int]:
+    rows = (n + world - 1) // world
+    start = rank * rows
+    end = min(start + rows, n)
+    return start, end, rows
+
+
+def _sp_pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+    if x.shape[-2] == rows:
+        return x.contiguous()
+    out = x.new_zeros(*x.shape[:-2], rows, x.shape[-1])
+    if x.shape[-2] > 0:
+        out[..., : x.shape[-2], :] = x
+    return out
+
+
+def _sp_gather_rows(local: torch.Tensor, n: int, world: int) -> torch.Tensor:
+    flat = local.contiguous().view(-1)
+    gathered = torch.empty((world * flat.numel(),), device=local.device, dtype=local.dtype)
+    dist.all_gather_into_tensor(gathered, flat)
+    chunks = gathered.view(world, *local.shape)
+    return (
+        chunks.permute(1, 0, 2, 3)
+        .reshape(local.shape[0], world * local.shape[1], local.shape[2])
+        [:, :n]
+        .contiguous()
+    )
+
+
+def _sp_seq2head(x: torch.Tensor, world: int) -> torch.Tensor:
+    bsz, local_seq, heads, head_dim = x.shape
+    shard_heads = heads // world
+    send = x.reshape(bsz, local_seq, world, shard_heads, head_dim)
+    send = send.permute(2, 0, 1, 3, 4).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send)
+    return recv.permute(1, 0, 2, 3, 4).reshape(
+        bsz, world * local_seq, shard_heads, head_dim
+    ).contiguous()
+
+
+def _sp_seq2head_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    world: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bsz, local_seq, heads, head_dim = q.shape
+    shard_heads = heads // world
+    packed = torch.stack((q, k, v), dim=0)
+    send = packed.reshape(3, bsz, local_seq, world, shard_heads, head_dim)
+    send = send.permute(3, 0, 1, 2, 4, 5).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send)
+    packed = recv.permute(1, 2, 0, 3, 4, 5).reshape(
+        3, bsz, world * local_seq, shard_heads, head_dim
+    )
+    return tuple(t.contiguous() for t in packed.unbind(dim=0))
+
+
+def _sp_head2seq(x: torch.Tensor, world: int) -> torch.Tensor:
+    bsz, full_seq, shard_heads, head_dim = x.shape
+    local_seq = full_seq // world
+    send = x.reshape(bsz, world, local_seq, shard_heads, head_dim)
+    send = send.permute(1, 0, 3, 2, 4).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send)
+    return recv.permute(1, 3, 0, 2, 4).reshape(
+        bsz, local_seq, world * shard_heads, head_dim
+    ).contiguous()
+
+
+def _sp_valid_key_mask(n: int, n_pad: int, device: torch.device) -> Optional[torch.Tensor]:
+    if n_pad == n:
+        return None
+    mask = torch.zeros(n_pad, device=device, dtype=torch.bool)
+    mask[n:] = True
+    return mask.view(1, 1, 1, n_pad)
 
 
 class AttentionPairBias(nn.Module):
@@ -299,6 +411,7 @@ class DiffusionTransformerBlock(nn.Module):
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
+        self.profile_block_index = -1
 
     def forward(
         self,
@@ -331,6 +444,50 @@ class DiffusionTransformerBlock(nn.Module):
                 - s: the single embedding [..., N, c_s]
                 - z: the pair embedding
         """
+        profile_log = _diffusion_transformer_profile_path()
+        profile_enabled = profile_log is not None
+        timings_ms: dict[str, float] = {}
+
+        _diffusion_transformer_sync_if_needed(profile_enabled, a)
+        t_last = time.perf_counter()
+
+        def mark_profile(name: str, ref: torch.Tensor = a) -> None:
+            nonlocal t_last
+            if not profile_enabled:
+                return
+            _diffusion_transformer_sync_if_needed(True, ref)
+            now = time.perf_counter()
+            timings_ms[name] = timings_ms.get(name, 0.0) + (now - t_last) * 1000.0
+            t_last = now
+
+        def write_profile(ref: torch.Tensor) -> None:
+            if not profile_enabled:
+                return
+            _diffusion_transformer_sync_if_needed(True, ref)
+            payload = {
+                "path": "diffusion_transformer_block",
+                "block_index": int(self.profile_block_index),
+                "shape_a": [int(dim) for dim in a.shape],
+                "shape_s": [int(dim) for dim in s.shape],
+                "shape_z": [int(dim) for dim in z.shape],
+                "dtype": str(a.dtype),
+                "device": str(a.device),
+                "n_heads": int(self.n_heads),
+                "c_a": int(self.c_a),
+                "c_s": int(self.c_s),
+                "c_z": int(self.c_z),
+                "local_attention": bool(n_queries and n_keys),
+                "chunk_size": None if chunk_size is None else int(chunk_size),
+                "enable_efficient_fusion": bool(enable_efficient_fusion),
+                "timings_ms": timings_ms,
+                "total_ms": float(sum(timings_ms.values())),
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+
         attn_out = self.drop_path(
             self.attention_pair_bias(
                 a=a,
@@ -343,12 +500,17 @@ class DiffusionTransformerBlock(nn.Module):
                 enable_efficient_fusion=enable_efficient_fusion,
             )
         )
+        mark_profile("attention_pair_bias", attn_out)
         if inplace_safe:
             attn_out += a
         else:
             attn_out = attn_out + a
+        mark_profile("attention_residual", attn_out)
         ff_out = self.drop_path(self.conditioned_transition_block(a=attn_out, s=s))
+        mark_profile("conditioned_transition_block", ff_out)
         out_a = ff_out + attn_out
+        mark_profile("transition_residual", out_a)
+        write_profile(out_a)
         # Avoid s/z to be deleted by torch.utils.checkpoint
         return out_a, s, z
 
@@ -386,6 +548,7 @@ class DiffusionTransformer(nn.Module):
         self.c_s = c_s
         self.c_z = c_z
         self.blocks_per_ckpt = blocks_per_ckpt
+        self._ulysses_sp_bias_cache: dict[tuple, torch.Tensor] = {}
 
         self.blocks = nn.ModuleList()
         drop_path_rates = [
@@ -401,6 +564,7 @@ class DiffusionTransformer(nn.Module):
                 cross_attention_mode=cross_attention_mode,
                 drop_path_rate=drop_path_rates[i],
             )
+            block.profile_block_index = i
             self.blocks.append(block)
 
     def _prep_blocks(
@@ -423,6 +587,136 @@ class DiffusionTransformer(nn.Module):
             for b in self.blocks
         ]
         return blocks
+
+    def _ulysses_sp_cache_key(
+        self,
+        block_idx: int,
+        z: torch.Tensor,
+        rows: int,
+        world: int,
+        rank: int,
+    ) -> tuple:
+        return (
+            block_idx,
+            int(z.untyped_storage().data_ptr()),
+            tuple(int(dim) for dim in z.shape),
+            tuple(int(stride) for stride in z.stride()),
+            str(z.dtype),
+            str(z.device),
+            int(rows),
+            int(world),
+            int(rank),
+        )
+
+    def _ulysses_sp_local_head_bias(
+        self,
+        block_idx: int,
+        z: torch.Tensor,
+        rows: int,
+        world: int,
+        rank: int,
+    ) -> torch.Tensor:
+        block = self.blocks[block_idx]
+        module = block.attention_pair_bias
+        n = z.shape[-3]
+        n_pad = rows * world
+        shard_heads = module.attention.num_heads // world
+        head_start = rank * shard_heads
+        head_end = head_start + shard_heads
+
+        key = self._ulysses_sp_cache_key(block_idx, z, rows, world, rank)
+        cached = self._ulysses_sp_bias_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if z.dim() == 4 and z.stride(0) == 0:
+            z_for_bias = z[:1]
+        else:
+            z_for_bias = z
+        z_norm = module.layernorm_z(z_for_bias)
+        weight = module.linear_nobias_z.weight[head_start:head_end]
+        bias = F.linear(z_norm, weight)
+        bias = permute_final_dims(bias, [2, 0, 1]).contiguous()
+        if n_pad != n:
+            out = bias.new_zeros(*bias.shape[:-2], n_pad, n_pad)
+            out[..., :n, :n] = bias
+            bias = out
+        if z.dim() == 4 and z.stride(0) == 0 and z.shape[0] != bias.shape[0]:
+            bias = bias.expand(z.shape[0], *bias.shape[1:])
+        max_entries = int(os.environ.get("PROTENIX_DIFFUSION_ULYSSES_SP_CACHE_MAX", "64"))
+        if len(self._ulysses_sp_bias_cache) >= max_entries:
+            self._ulysses_sp_bias_cache.clear()
+        self._ulysses_sp_bias_cache[key] = bias
+        return bias
+
+    def _ulysses_sp_project_qkv(self, module: AttentionPairBias, q_x: torch.Tensor):
+        attn = module.attention
+        q = attn.linear_q(q_x)
+        k = attn.linear_k(q_x)
+        v = attn.linear_v(q_x)
+        q = q.view(*q.shape[:-1], attn.num_heads, attn.c_hidden)
+        k = k.view(*k.shape[:-1], attn.num_heads, attn.c_hidden)
+        v = v.view(*v.shape[:-1], attn.num_heads, attn.c_hidden)
+        q = q / (attn.c_hidden**0.5)
+        return q, k, v
+
+    def _ulysses_sp_attention(
+        self,
+        block_idx: int,
+        local_a: torch.Tensor,
+        local_s: torch.Tensor,
+        z: torch.Tensor,
+        n: int,
+        rows: int,
+        world: int,
+        rank: int,
+    ) -> torch.Tensor:
+        module = self.blocks[block_idx].attention_pair_bias
+        q_x = module.layernorm_a(a=local_a, s=local_s)
+        q_local, k_local, v_local = self._ulysses_sp_project_qkv(module, q_x)
+
+        q, k, v = _sp_seq2head_qkv(q_local, k_local, v_local, world)
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+        bias = self._ulysses_sp_local_head_bias(block_idx, z, rows, world, rank)
+
+        logits = torch.matmul(q, k.transpose(-1, -2)) + bias
+        mask = _sp_valid_key_mask(n, rows * world, logits.device)
+        if mask is not None:
+            logits = logits.masked_fill(mask, -torch.inf)
+        attn_out = torch.matmul(torch.softmax(logits, dim=-1), v)
+
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous()
+        local_heads = _sp_head2seq(attn_out, world)
+        out = module.attention._wrap_up(local_heads, q_x)
+        return torch.sigmoid(module.linear_a_last(local_s)) * out
+
+    def _ulysses_sp_forward(
+        self,
+        a: torch.Tensor,
+        s: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        world = dist.get_world_size()
+        rank = dist.get_rank()
+        if self.n_heads % world != 0:
+            raise ValueError(
+                f"Diffusion Ulysses SP requires n_heads ({self.n_heads}) divisible by world ({world})"
+            )
+        n = a.shape[-2]
+        start, end, rows = _sp_row_bounds(n, world, rank)
+        local_a = _sp_pad_rows(a[:, start:end], rows)
+        local_s = _sp_pad_rows(s[:, start:end], rows)
+
+        for block_idx, block in enumerate(self.blocks):
+            local_attn = self._ulysses_sp_attention(
+                block_idx, local_a, local_s, z, n, rows, world, rank
+            )
+            local_a = local_attn + local_a
+            local_a = block.conditioned_transition_block(a=local_a, s=local_s) + local_a
+
+        return _sp_gather_rows(local_a, n, world)
 
     def forward(
         self,
@@ -451,6 +745,17 @@ class DiffusionTransformer(nn.Module):
                     torch.Tensor: the output of DiffusionTransformer
                         [..., N, c_a]
         """
+        if (
+            _diffusion_ulysses_enabled()
+            and dist.is_available()
+            and _diffusion_ulysses_init_if_needed(a)
+            and not torch.is_grad_enabled()
+            and n_queries is None
+            and n_keys is None
+            and not enable_efficient_fusion
+        ):
+            return self._ulysses_sp_forward(a=a, s=s, z=z)
+
         blocks = self._prep_blocks(
             n_queries=n_queries,
             n_keys=n_keys,

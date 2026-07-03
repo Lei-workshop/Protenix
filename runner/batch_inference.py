@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 
 import click
 import tqdm
+import torch.distributed as dist
 from Bio import SeqIO
 
 from configs.configs_base import configs as configs_base
@@ -36,6 +37,7 @@ from protenix.config.config import parse_configs
 from protenix.data.inference.json_maker import cif_to_input_json
 from protenix.data.inference.json_parser import lig_file_to_atom_info
 from protenix.data.utils import pdb_to_cif
+from protenix.utils.distributed import DIST_WRAPPER
 from protenix.utils.logger import get_logger
 from protenix.version import __version__
 from rdkit import Chem
@@ -162,6 +164,95 @@ def preprocess_input(
         return output_json
     else:
         return msa_updated_json
+
+
+def preprocess_input_distributed(
+    input_json: str,
+    out_dir: str,
+    use_msa: bool = True,
+    use_template: bool = False,
+    use_rna_msa: bool = False,
+    msa_server_mode: str = "protenix",
+    hmmsearch_binary_path: Optional[str] = None,
+    hmmbuild_binary_path: Optional[str] = None,
+    seqres_database_path: Optional[str] = None,
+    nhmmer_binary_path: Optional[str] = None,
+    hmmalign_binary_path: Optional[str] = None,
+    hmmbuild_rna_binary_path: Optional[str] = None,
+    ntrna_database_path: Optional[str] = None,
+    rfam_database_path: Optional[str] = None,
+    rna_central_database_path: Optional[str] = None,
+    nhmmer_n_cpu: Optional[int] = None,
+) -> str:
+    """
+    Run input preprocessing once on rank 0 and broadcast the resulting JSON path.
+
+    This is paired with PROTENIX_DISTRIBUTED_DATA_BROADCAST, where rank 0 also
+    builds and broadcasts dataloader batches to avoid repeated CPU preprocessing.
+    """
+    broadcast_preprocess = (
+        os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
+        and DIST_WRAPPER.world_size > 1
+        and dist.is_available()
+        and dist.is_initialized()
+    )
+    if not broadcast_preprocess:
+        return preprocess_input(
+            input_json,
+            out_dir=out_dir,
+            use_msa=use_msa,
+            use_template=use_template,
+            use_rna_msa=use_rna_msa,
+            msa_server_mode=msa_server_mode,
+            hmmsearch_binary_path=hmmsearch_binary_path,
+            hmmbuild_binary_path=hmmbuild_binary_path,
+            seqres_database_path=seqres_database_path,
+            nhmmer_binary_path=nhmmer_binary_path,
+            hmmalign_binary_path=hmmalign_binary_path,
+            hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+            ntrna_database_path=ntrna_database_path,
+            rfam_database_path=rfam_database_path,
+            rna_central_database_path=rna_central_database_path,
+            nhmmer_n_cpu=nhmmer_n_cpu,
+        )
+
+    payload = [None, None]
+    if DIST_WRAPPER.rank == 0:
+        try:
+            payload[0] = preprocess_input(
+                input_json,
+                out_dir=out_dir,
+                use_msa=use_msa,
+                use_template=use_template,
+                use_rna_msa=use_rna_msa,
+                msa_server_mode=msa_server_mode,
+                hmmsearch_binary_path=hmmsearch_binary_path,
+                hmmbuild_binary_path=hmmbuild_binary_path,
+                seqres_database_path=seqres_database_path,
+                nhmmer_binary_path=nhmmer_binary_path,
+                hmmalign_binary_path=hmmalign_binary_path,
+                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                ntrna_database_path=ntrna_database_path,
+                rfam_database_path=rfam_database_path,
+                rna_central_database_path=rna_central_database_path,
+                nhmmer_n_cpu=nhmmer_n_cpu,
+            )
+        except Exception as exc:
+            payload[1] = str(exc)
+
+    dist.broadcast_object_list(payload, src=0)
+    if payload[1] is not None:
+        raise RuntimeError(payload[1])
+    if payload[0] is None:
+        raise RuntimeError(
+            f"Rank 0 did not provide a preprocessed JSON for {input_json}"
+        )
+
+    if DIST_WRAPPER.rank != 0:
+        logger.info(
+            f"[Rank {DIST_WRAPPER.rank}] Received preprocessed input JSON: {payload[0]}"
+        )
+    return payload[0]
 
 
 def generate_infer_jsons(protein_msa_res: dict, ligand_file: str) -> List[str]:
@@ -537,7 +628,7 @@ def inference_jsons(
     configs = runner.configs
     for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
         try:
-            configs["input_json_path"] = preprocess_input(
+            configs["input_json_path"] = preprocess_input_distributed(
                 infer_json,
                 out_dir=out_dir,
                 use_msa=use_msa,
@@ -637,7 +728,7 @@ def protenix_cli() -> None:
     default="cuequivariance",
     help=(
         "Triangle attention kernel ('triattention', 'cuequivariance', "
-        "'deepspeed', or 'torch')."
+        "'deepspeed', 'wmma', or 'torch')."
     ),
 )
 @click.option(
@@ -868,9 +959,9 @@ def predict(
         "cuequivariance",
         "torch",
     ], "Invalid trimul_kernel. Options: 'cuequivariance', 'torch'."
-    assert triatt_kernel in ["triattention", "cuequivariance", "deepspeed", "torch",], (
+    assert triatt_kernel in ["triattention", "cuequivariance", "deepspeed", "wmma", "torch",], (
         "Invalid triatt_kernel. Options: 'triattention', "
-        "'cuequivariance', 'deepspeed', 'torch'."
+        "'cuequivariance', 'deepspeed', 'wmma', 'torch'."
     )
     seeds = list(map(int, seeds.split(",")))
 

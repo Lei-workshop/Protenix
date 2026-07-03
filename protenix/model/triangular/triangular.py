@@ -14,15 +14,60 @@
 # Copyright 2021 AlQuraishi Laboratory
 
 
+import json
+import os
+import time
 from abc import ABC, abstractmethod
 from functools import partial, partialmethod
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from protenix.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
 from protenix.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
+
+
+def _trimul_profile_path() -> Optional[str]:
+    return os.environ.get("TRIMUL_PROFILE_LOG")
+
+
+def _trimul_sync_if_needed(enabled: bool, tensor: torch.Tensor) -> None:
+    if enabled and tensor.is_cuda:
+        torch.cuda.synchronize()
+
+
+def _trimul_opt_version() -> str:
+    return os.environ.get("TRIMUL_OPT_VERSION", "").strip().lower()
+
+
+def _trimul_chunk_size(default: Optional[int]) -> Optional[int]:
+    value = os.environ.get("TRIMUL_INPLACE_CHUNK_SIZE")
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in ("", "none", "null", "0", "-1"):
+        return None
+    return int(value)
+
+
+def _trimul_auto_chunk_size(S_dim: int, default: Optional[int]) -> Optional[int]:
+    if os.environ.get("TRIMUL_INPLACE_CHUNK_SIZE") is not None:
+        return _trimul_chunk_size(default)
+    if _trimul_opt_version() == "auto" and default is not None and S_dim >= 1024:
+        return 512
+    return default
+
+
+def _trimul_a_projection_chunk_size(default: Optional[int]) -> Optional[int]:
+    value = os.environ.get("TRIMUL_A_PROJ_CHUNK_SIZE")
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in ("", "none", "null", "0", "-1"):
+        return None
+    return int(value)
 
 
 def kernel_triangular_mult(
@@ -195,6 +240,33 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         self.linear_b_g = OpenfoldLinear(
             self.c_z, self.c_hidden, bias=False, init="gating"
         )
+        self._grouped_projection_weight_cache = {}
+
+    def _get_grouped_projection_weight(
+        self,
+        linear_g: OpenfoldLinear,
+        linear_p: OpenfoldLinear,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (
+            linear_g.weight.data_ptr(),
+            linear_p.weight.data_ptr(),
+            linear_g.weight._version,
+            linear_p.weight._version,
+            dtype,
+            device,
+        )
+        cached = self._grouped_projection_weight_cache.get(key)
+        if cached is not None:
+            return cached
+
+        weight = torch.cat((linear_g.weight, linear_p.weight), dim=0)
+        if weight.dtype != dtype or weight.device != device:
+            weight = weight.to(device=device, dtype=dtype)
+        self._grouped_projection_weight_cache.clear()
+        self._grouped_projection_weight_cache[key] = weight
+        return weight
 
     def _inference_forward(
         self,
@@ -202,6 +274,9 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         mask: Optional[torch.Tensor] = None,
         inplace_chunk_size: Optional[int] = None,
         with_add: bool = True,
+        _profile_mark=None,
+        _opt_version: str = "",
+        _a_projection_chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -264,10 +339,18 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         """
         if mask is None:
             mask = z.new_ones(z.shape[:-1])
+        if _profile_mark is not None:
+            _profile_mark("inference_mask_prepare")
 
         mask = mask.unsqueeze(-1)
+        if _profile_mark is not None:
+            _profile_mark("inference_mask_unsqueeze")
 
-        def compute_projection_helper(pair, mask, a=True):
+        use_grouped_projection = _opt_version in ("v1", "v3")
+        use_cached_grouped_projection = _opt_version == "v3"
+        reuse_incoming_gate_norm = _opt_version in ("v1", "v2", "v3", "auto")
+
+        def compute_projection_helper(pair, mask, a=True, pair_norm=None):
             if a:
                 linear_g = self.linear_a_g
                 linear_p = self.linear_a_p
@@ -275,17 +358,30 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 linear_g = self.linear_b_g
                 linear_p = self.linear_b_p
 
-            pair = self.layer_norm_in(pair)
-            p = linear_g(pair)
-            p.sigmoid_()
-            p *= linear_p(pair)
+            pair = self.layer_norm_in(pair) if pair_norm is None else pair_norm
+            if use_grouped_projection:
+                if use_cached_grouped_projection:
+                    weight = self._get_grouped_projection_weight(
+                        linear_g, linear_p, pair.dtype, pair.device
+                    )
+                else:
+                    weight = torch.cat((linear_g.weight, linear_p.weight), dim=0)
+                    if weight.dtype != pair.dtype:
+                        weight = weight.to(dtype=pair.dtype)
+                gp = F.linear(pair, weight)
+                g, p = gp.split(self.c_hidden, dim=-1)
+                p = p * torch.sigmoid(g)
+            else:
+                p = linear_g(pair)
+                p.sigmoid_()
+                p *= linear_p(pair)
             p *= mask
             p = permute_final_dims(p, (2, 0, 1))
             return p
 
-        def compute_projection(pair, mask, a=True, chunked=True):
+        def compute_projection(pair, mask, a=True, chunk_size: Optional[int] = None):
             need_transpose = self._outgoing ^ a
-            if not chunked:
+            if chunk_size is None:
                 p = compute_projection_helper(pair, mask, a)
                 if need_transpose:
                     p = p.transpose(-1, -2)
@@ -296,19 +392,19 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 c = linear_g.weight.shape[0]
                 out_shape = pair.shape[:-3] + (c,) + pair.shape[-3:-1]
                 p = pair.new_zeros(out_shape)
-                for i in range(0, pair.shape[-3], inplace_chunk_size):
-                    pair_chunk = pair[..., i : i + inplace_chunk_size, :, :]
-                    mask_chunk = mask[..., i : i + inplace_chunk_size, :, :]
+                for i in range(0, pair.shape[-3], chunk_size):
+                    pair_chunk = pair[..., i : i + chunk_size, :, :]
+                    mask_chunk = mask[..., i : i + chunk_size, :, :]
                     pair_chunk = compute_projection_helper(
-                        pair[..., i : i + inplace_chunk_size, :, :],
-                        mask[..., i : i + inplace_chunk_size, :, :],
+                        pair[..., i : i + chunk_size, :, :],
+                        mask[..., i : i + chunk_size, :, :],
                         a,
                     )
                     if need_transpose:
                         pair_chunk = pair_chunk.transpose(-1, -2)
-                        p[..., i : i + inplace_chunk_size] = pair_chunk
+                        p[..., i : i + chunk_size] = pair_chunk
                     else:
-                        p[..., i : i + inplace_chunk_size, :] = pair_chunk
+                        p[..., i : i + chunk_size, :] = pair_chunk
 
                     del pair_chunk
 
@@ -317,7 +413,11 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         # We start by fully manifesting a. In addition to the input, this
         # brings total memory consumption to 2x z (disregarding size of chunks)
         # [*, N, N, c]
-        a = compute_projection(z, mask, True, chunked=True)
+        a = compute_projection(
+            z, mask, True, chunk_size=_a_projection_chunk_size
+        )
+        if _profile_mark is not None:
+            _profile_mark("compute_a_projection_total")
 
         if inplace_chunk_size is not None:
             n = a.shape[-1]
@@ -370,6 +470,8 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             z_cache_slicer[col_dim] = slice(0, half_n)
             z_cache.copy_(z[tuple(z_cache_slicer)])
             z_cache_rotated = False
+            if _profile_mark is not None:
+                _profile_mark("z_cache_init")
 
             # We need to reorient the z-cache at the halfway point, and we
             # don't want a single chunk to straddle that point. We contract one
@@ -387,6 +489,8 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 if not z_cache_rotated and i >= half_n:
                     z_cache = flip_z_cache_(z_cache, z)
                     z_cache_rotated = True
+                    if _profile_mark is not None:
+                        _profile_mark("z_cache_rotate")
 
                 z_chunk_b = slice_tensor(
                     z,
@@ -401,10 +505,10 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                     b_chunk_dim,
                 )
 
-                z_chunk_b = z_chunk_b.clone()
                 if b_chunk_dim == col_dim:
                     z_chunk_b = slice_tensor(z, i, i + offset, col_dim)
                 else:  # b_chunk_dim == row_dim
+                    z_chunk_b = z_chunk_b.clone()
                     # In this case, the b-dimension (b_chunk_dim) is partially
                     # overwritten at the end of each iteration. We need to
                     # restore the missing component from the z-cache.
@@ -422,28 +526,52 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                         z_chunk_b = slice_tensor(
                             z_cache, z_cache_offset, z_cache_offset + offset, row_dim
                         )
+                if _profile_mark is not None:
+                    _profile_mark("chunk_recover_z")
 
-                b_chunk = compute_projection(
-                    z_chunk_b, mask_chunk, a=False, chunked=False
-                )
+                reuse_gate_norm = reuse_incoming_gate_norm and (not self._outgoing)
+                if reuse_gate_norm:
+                    z_chunk_b_norm = self.layer_norm_in(z_chunk_b)
+                    b_chunk = compute_projection_helper(
+                        z_chunk_b, mask_chunk, a=False, pair_norm=z_chunk_b_norm
+                    )
+                else:
+                    z_chunk_b_norm = None
+                    b_chunk = compute_projection(
+                        z_chunk_b, mask_chunk, a=False, chunk_size=None
+                    )
                 del z_chunk_b
+                if _profile_mark is not None:
+                    _profile_mark("chunk_b_projection")
 
                 x_chunk = torch.matmul(
                     a,
                     b_chunk,
                 )
                 x_chunk = permute_final_dims(x_chunk, (1, 2, 0))
+                if _profile_mark is not None:
+                    _profile_mark("chunk_combine_matmul")
                 x_chunk = self.layer_norm_out(x_chunk)
                 x_chunk = self.linear_z(x_chunk)
+                if _profile_mark is not None:
+                    _profile_mark("chunk_out_norm_linear")
 
                 # The g dimension (col_dim) is parallel to and ahead of the
                 # overwrites in z. We can extract the g chunk normally.
-                z_chunk_g = slice_tensor(z, i, i + offset, col_dim)
-                g_chunk = self.linear_g(self.layer_norm_in(z_chunk_g))
+                if reuse_gate_norm:
+                    g_chunk = self.linear_g(z_chunk_b_norm)
+                    del z_chunk_b_norm
+                else:
+                    z_chunk_g = slice_tensor(z, i, i + offset, col_dim)
+                    g_chunk = self.linear_g(self.layer_norm_in(z_chunk_g))
+                    del z_chunk_g
                 g_chunk.sigmoid_()
-                del z_chunk_g
+                if _profile_mark is not None:
+                    _profile_mark("chunk_gate")
 
                 x_chunk *= g_chunk
+                if _profile_mark is not None:
+                    _profile_mark("chunk_output_mul")
 
                 # Write the columns into z in-place
                 z_slicer = empty_slicer(z)
@@ -452,18 +580,33 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                     z[tuple(z_slicer)] += x_chunk
                 else:
                     z[tuple(z_slicer)] = x_chunk
+                if _profile_mark is not None:
+                    _profile_mark("chunk_write")
         else:
-            b = compute_projection(z, mask, False, False)
+            b = compute_projection(z, mask, False, chunk_size=None)
+            if _profile_mark is not None:
+                _profile_mark("compute_b_projection_total")
             x = torch.matmul(a, b)
+            x = permute_final_dims(x, (1, 2, 0))
+            if _profile_mark is not None:
+                _profile_mark("combine_matmul")
             x = self.layer_norm_out(x)
             x = self.linear_z(x)
+            if _profile_mark is not None:
+                _profile_mark("out_norm_linear")
             g = self.linear_g(z)
             g.sigmoid_()
+            if _profile_mark is not None:
+                _profile_mark("output_gate")
             x *= g
+            if _profile_mark is not None:
+                _profile_mark("output_mul")
             if with_add:
                 z += x
             else:
                 z = x
+            if _profile_mark is not None:
+                _profile_mark("output_write")
 
         return z
 
@@ -486,6 +629,59 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             [*, N_res, N_res, C_z] output tensor
         """
         _input_inplace_safe = inplace_safe is True
+        trimul_opt_version = _trimul_opt_version()
+        _inplace_chunk_size = _trimul_auto_chunk_size(int(z.shape[-2]), _inplace_chunk_size)
+        _a_projection_chunk_size = _trimul_a_projection_chunk_size(_inplace_chunk_size)
+        profile_log = _trimul_profile_path()
+        profile_enabled = profile_log is not None
+        input_shape = [int(dim) for dim in z.shape]
+        direction = "outgoing" if self._outgoing else "incoming"
+        timings_ms = {}
+
+        _trimul_sync_if_needed(profile_enabled, z)
+        t_last = time.perf_counter()
+
+        def mark_profile(name: str) -> None:
+            nonlocal t_last
+            if not profile_enabled:
+                return
+            _trimul_sync_if_needed(True, z)
+            now = time.perf_counter()
+            timings_ms[name] = timings_ms.get(name, 0.0) + (now - t_last) * 1000.0
+            t_last = now
+
+        def write_profile(effective_kernel: str) -> None:
+            if not profile_enabled:
+                return
+            payload = {
+                "path": "triangle_multiplicative",
+                "requested_kernel": triangle_multiplicative,
+                "effective_kernel": effective_kernel,
+                "direction": direction,
+                "shape": input_shape,
+                "dtype": str(z.dtype),
+                "device": str(z.device),
+                "c_z": int(self.c_z),
+                "c_hidden": int(self.c_hidden),
+                "inplace_safe": bool(inplace_safe),
+                "add_with_inplace": bool(_add_with_inplace),
+                "inplace_chunk_size": (
+                    None if _inplace_chunk_size is None else int(_inplace_chunk_size)
+                ),
+                "a_projection_chunk_size": (
+                    None
+                    if _a_projection_chunk_size is None
+                    else int(_a_projection_chunk_size)
+                ),
+                "opt_version": trimul_opt_version,
+                "timings_ms": timings_ms,
+                "total_ms": float(sum(timings_ms.values())),
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
 
         # Note: cuequivariance requires that the hidden dimension c must equal c_z.
         # If this condition is not met, an AssertionError will be raised.
@@ -494,9 +690,10 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
             if _input_inplace_safe and _add_with_inplace:
                 z_in = z.clone()
+                mark_profile("clone_input")
             z = kernel_triangular_mult(
                 z[None],
-                direction="outgoing" if self._outgoing else "incoming",
+                direction=direction,
                 mask=z.new_ones(z.shape[:-1])[None] if mask is None else mask,
                 norm_in_weight=self.layer_norm_in.weight,
                 norm_in_bias=self.layer_norm_in.bias,
@@ -512,35 +709,57 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 g_out_weight=self.linear_g.weight,
                 eps=1e-5,  # In BF16, we use the default eps of 1e-5.
             )[0]
+            mark_profile("cuequivariance_kernel")
             if _input_inplace_safe and _add_with_inplace:
-                return z + z_in
+                z = z + z_in
+                mark_profile("add_input")
+                write_profile("cuequivariance")
+                return z
             else:
+                write_profile("cuequivariance")
                 return z
         elif (triangle_multiplicative == "torch") or (self.c_z != self.c_hidden):
+            effective_kernel = (
+                "torch_fallback_hidden_mismatch"
+                if triangle_multiplicative == "cuequivariance"
+                else "torch"
+            )
             if inplace_safe:
                 x = self._inference_forward(
                     z,
                     mask,
                     inplace_chunk_size=_inplace_chunk_size,
                     with_add=_add_with_inplace,
+                    _profile_mark=mark_profile if profile_enabled else None,
+                    _opt_version=trimul_opt_version,
+                    _a_projection_chunk_size=_a_projection_chunk_size,
                 )
+                write_profile(effective_kernel)
                 return x
 
             if mask is None:
                 mask = z.new_ones(z.shape[:-1])
+                mark_profile("mask_prepare")
 
             mask = mask.unsqueeze(-1)
+            mark_profile("mask_unsqueeze")
 
             if _input_inplace_safe and _add_with_inplace:
                 z_in = z.clone()
+                mark_profile("clone_input")
 
             z = self.layer_norm_in(z)
+            mark_profile("layer_norm_in")
             a = mask
             a = a * self.sigmoid(self.linear_a_g(z))
+            mark_profile("a_gate_linear")
             a = a * self.linear_a_p(z)
+            mark_profile("a_projection_linear")
             b = mask
             b = b * self.sigmoid(self.linear_b_g(z))
+            mark_profile("b_gate_linear")
             b = b * self.linear_b_p(z)
+            mark_profile("b_projection_linear")
 
             # Prevents overflow of torch.matmul in combine projections in
             # reduced-precision modes
@@ -549,20 +768,28 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             if is_fp16_enabled() and a_std != 0.0 and b_std != 0.0:
                 a = a / a.std()
                 b = b / b.std()
+            mark_profile("std_guard")
 
             if is_fp16_enabled():
                 with torch.amp.autocast("cuda", enabled=False):
                     x = self._combine_projections(a.float(), b.float())
             else:
                 x = self._combine_projections(a, b)
+            mark_profile("combine_matmul")
 
             del a, b
             x = self.layer_norm_out(x)
+            mark_profile("layer_norm_out")
             x = self.linear_z(x)
+            mark_profile("linear_z")
             g = self.sigmoid(self.linear_g(z))
+            mark_profile("output_gate")
             x = x * g
+            mark_profile("output_mul")
             if _input_inplace_safe and _add_with_inplace:
                 x = x + z_in
+                mark_profile("add_input")
+            write_profile(effective_kernel)
             return x
         else:
             raise ValueError(
