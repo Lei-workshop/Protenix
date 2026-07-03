@@ -13,10 +13,14 @@
 # limitations under the License.
 
 # pylint: disable=C0114
+import json
+import os
+import time
 from functools import partial
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -35,8 +39,130 @@ from protenix.model.utils import (
     expand_at_dim,
     get_checkpoint_fn,
     pad_at_dim,
+    permute_final_dims,
     sample_msa_feature_dict_random_without_replacement,
 )
+
+
+def _pairformer_profile_path() -> Optional[str]:
+    return os.environ.get("PAIRFORMER_PROFILE_LOG")
+
+
+def _pairformer_sync_if_needed(enabled: bool, ref: torch.Tensor) -> None:
+    if enabled and ref.is_cuda:
+        torch.cuda.synchronize(ref.device)
+
+
+def _pairformer_row_parallel_enabled(
+    z: torch.Tensor,
+    triangle_multiplicative: str,
+    triangle_attention: str,
+    training: bool,
+) -> bool:
+    if os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") != "1":
+        return False
+    if training or torch.is_grad_enabled():
+        return False
+    if triangle_multiplicative != "torch" or triangle_attention != "wmma":
+        return False
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return z.is_cuda and world_size > 1
+
+
+def _pairformer_row_parallel_init(z: torch.Tensor) -> tuple[int, int]:
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if z.device.type == "cuda":
+        torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        try:
+            dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+        except TypeError:
+            dist.init_process_group("nccl")
+    return dist.get_rank(), dist.get_world_size()
+
+
+def _pairformer_row_bounds(n: int, world: int, rank: int) -> tuple[int, int, int]:
+    rows = (n + world - 1) // world
+    start = rank * rows
+    end = min(start + rows, n)
+    return start, end, rows
+
+
+def _pairformer_pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+    if x.shape[-3] == rows:
+        return x.contiguous()
+    out = x.new_zeros((*x.shape[:-3], rows, *x.shape[-2:]))
+    if x.shape[-3] > 0:
+        out[..., : x.shape[-3], :, :].copy_(x)
+    return out
+
+
+def _pairformer_gather_rows(local: torch.Tensor, n: int, world: int) -> torch.Tensor:
+    flat = local.contiguous().view(-1)
+    gathered = torch.empty((world * flat.numel(),), device=local.device, dtype=local.dtype)
+    dist.all_gather_into_tensor(gathered, flat)
+    chunks = gathered.view(world, *local.shape)
+    return (
+        chunks.permute(1, 0, 2, 3, 4)
+        .reshape(local.shape[0], world * local.shape[1], *local.shape[2:])
+        [:, :n]
+        .contiguous()
+    )
+
+
+def _pairformer_trimul_project_a_b(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
+    mask = mask.unsqueeze(-1)
+    a = mask * torch.sigmoid(module.linear_a_g(z_norm))
+    a = a * module.linear_a_p(z_norm)
+    b = mask * torch.sigmoid(module.linear_b_g(z_norm))
+    b = b * module.linear_b_p(z_norm)
+    return a, b
+
+
+def _pairformer_trimul_update_rows(
+    module: nn.Module,
+    z: torch.Tensor,
+    mask: torch.Tensor,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    z_norm = module.layer_norm_in(z)
+    a, b = _pairformer_trimul_project_a_b(module, z_norm, mask)
+    if module._outgoing:
+        x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
+    else:
+        x = torch.einsum("bkic,bkjc->bijc", a[:, :, start:end], b)
+    x = module.layer_norm_out(x)
+    x = module.linear_z(x)
+    g = torch.sigmoid(module.linear_g(z_norm[:, start:end]))
+    return x * g
+
+
+def _pairformer_triangle_attention_shard(
+    module: nn.Module,
+    local_x: torch.Tensor,
+    local_mask: torch.Tensor,
+) -> torch.Tensor:
+    x = module.layer_norm(local_x)
+    mask_bias = (module.inf * (local_mask - 1))[..., :, None, None, :]
+    triangle_bias = permute_final_dims(module.linear(x), (2, 0, 1)).unsqueeze(-4)
+
+    # WMMA v9 wrapper currently expects Bias2 as [B, 1, H, S, S]. A row-shard
+    # naturally produces [B, 1, H, rows, S], so pack rows at the front.
+    seq = local_x.shape[-2]
+    if triangle_bias.shape[-2] != seq:
+        padded_bias = triangle_bias.new_zeros(
+            *triangle_bias.shape[:-2], seq, triangle_bias.shape[-1]
+        )
+        padded_bias[..., : triangle_bias.shape[-2], :] = triangle_bias
+        triangle_bias = padded_bias
+
+    return module.mha(
+        q_x=x,
+        kv_x=x,
+        biases=[mask_bias, triangle_bias],
+        triangle_attention="wmma",
+    )
 
 
 class PairformerBlock(nn.Module):
@@ -99,6 +225,70 @@ class PairformerBlock(nn.Module):
                 has_s=False, create_offset_ln_z=True, n_heads=n_heads, c_a=c_s, c_z=c_z
             )
             self.single_transition = Transition(c_in=c_s, n=4)
+        self.profile_block_index = -1
+
+    def _forward_row_parallel_experimental(
+        self,
+        s: Optional[torch.Tensor],
+        z: torch.Tensor,
+        pair_mask: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Experimental 4-GPU row-parallel z-triangle path.
+
+        This path intentionally covers only the z-heavy triangle subgraph. It
+        all-gathers full z after each residual-producing triangle module, then
+        runs pair_transition and optional s updates replicated on every rank.
+        """
+        squeeze_batch = z.dim() == 3
+        if squeeze_batch:
+            z = z.unsqueeze(0)
+            pair_mask = pair_mask.unsqueeze(0) if pair_mask is not None else None
+
+        rank, world = _pairformer_row_parallel_init(z)
+        start, end, rows = _pairformer_row_bounds(z.shape[-3], world, rank)
+        n = z.shape[-3]
+        if pair_mask is None:
+            pair_mask = z.new_ones(z.shape[:-1])
+
+        update = _pairformer_trimul_update_rows(
+            self.tri_mul_out, z, pair_mask, start, end
+        )
+        local = _pairformer_pad_rows(z[:, start:end] + update, rows)
+        z = _pairformer_gather_rows(local, n, world)
+
+        update = _pairformer_trimul_update_rows(
+            self.tri_mul_in, z, pair_mask, start, end
+        )
+        local = _pairformer_pad_rows(z[:, start:end] + update, rows)
+        z = _pairformer_gather_rows(local, n, world)
+
+        local_z = _pairformer_pad_rows(z[:, start:end], rows)
+        local_mask = _pairformer_pad_rows(pair_mask[:, start:end].unsqueeze(-1), rows).squeeze(-1)
+        local_update = _pairformer_triangle_attention_shard(
+            self.tri_att_start, local_z, local_mask
+        )
+        z = _pairformer_gather_rows(local_z + local_update, n, world)
+
+        z = z.transpose(-2, -3).contiguous()
+        mask_t = pair_mask.transpose(-1, -2).contiguous()
+        local_z = _pairformer_pad_rows(z[:, start:end], rows)
+        local_mask = _pairformer_pad_rows(mask_t[:, start:end].unsqueeze(-1), rows).squeeze(-1)
+        local_update = _pairformer_triangle_attention_shard(
+            self.tri_att_end, local_z, local_mask
+        )
+        z = _pairformer_gather_rows(local_z + local_update, n, world)
+        z = z.transpose(-2, -3).contiguous()
+
+        z = z + self.pair_transition(z)
+
+        if squeeze_batch:
+            z = z.squeeze(0)
+            pair_mask = pair_mask.squeeze(0)
+
+        if self.c_s > 0:
+            s = s + self.attention_pair_bias(a=s, s=None, z=z)
+            s = s + self.single_transition(s)
+        return s, z
 
     def forward(
         self,
@@ -135,6 +325,54 @@ class PairformerBlock(nn.Module):
                 [..., N_token, c_s] | None
                 [..., N_token, N_token, c_z]
         """
+        if _pairformer_row_parallel_enabled(
+            z=z,
+            triangle_multiplicative=triangle_multiplicative,
+            triangle_attention=triangle_attention,
+            training=self.training,
+        ):
+            return self._forward_row_parallel_experimental(s=s, z=z, pair_mask=pair_mask)
+
+        profile_log = _pairformer_profile_path()
+        profile_enabled = profile_log is not None
+        timings_ms: dict[str, float] = {}
+
+        _pairformer_sync_if_needed(profile_enabled, z)
+        t_last = time.perf_counter()
+
+        def mark_profile(name: str) -> None:
+            nonlocal t_last
+            if not profile_enabled:
+                return
+            _pairformer_sync_if_needed(True, z)
+            now = time.perf_counter()
+            timings_ms[name] = timings_ms.get(name, 0.0) + (now - t_last) * 1000.0
+            t_last = now
+
+        def write_profile() -> None:
+            if not profile_enabled:
+                return
+            payload = {
+                "path": "pairformer_block",
+                "block_index": int(self.profile_block_index),
+                "shape_s": None if s is None else [int(dim) for dim in s.shape],
+                "shape_z": [int(dim) for dim in z.shape],
+                "dtype_s": None if s is None else str(s.dtype),
+                "dtype_z": str(z.dtype),
+                "device": str(z.device),
+                "triangle_multiplicative": triangle_multiplicative,
+                "triangle_attention": triangle_attention,
+                "inplace_safe": bool(inplace_safe),
+                "chunk_size": None if chunk_size is None else int(chunk_size),
+                "timings_ms": timings_ms,
+                "total_ms": float(sum(timings_ms.values())),
+            }
+            profile_dir = os.path.dirname(profile_log)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            with open(profile_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+
         if inplace_safe:
             z = self.tri_mul_out(
                 z,
@@ -143,6 +381,7 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=True,
                 triangle_multiplicative=triangle_multiplicative,
             )
+            mark_profile("tri_mul_out")
             z = self.tri_mul_in(
                 z,
                 mask=pair_mask,
@@ -150,6 +389,7 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=True,
                 triangle_multiplicative=triangle_multiplicative,
             )
+            mark_profile("tri_mul_in")
             z += self.tri_att_start(
                 z,
                 mask=pair_mask,
@@ -157,7 +397,9 @@ class PairformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+            mark_profile("tri_att_start_add")
             z = z.transpose(-2, -3).contiguous()
+            mark_profile("transpose_after_start")
             z += self.tri_att_end(
                 z,
                 mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
@@ -165,8 +407,11 @@ class PairformerBlock(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+            mark_profile("tri_att_end_add")
             z = z.transpose(-2, -3).contiguous()
+            mark_profile("transpose_after_end")
             z += self.pair_transition(z)
+            mark_profile("pair_transition_add")
         else:
             tmu_update = self.tri_mul_out(
                 z,
@@ -175,7 +420,9 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=False,
                 triangle_multiplicative=triangle_multiplicative,
             )
+            mark_profile("tri_mul_out")
             z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
+            mark_profile("dropout_add_tri_mul_out")
             del tmu_update
             tmu_update = self.tri_mul_in(
                 z,
@@ -184,43 +431,49 @@ class PairformerBlock(nn.Module):
                 _add_with_inplace=False,
                 triangle_multiplicative=triangle_multiplicative,
             )
+            mark_profile("tri_mul_in")
             z = dropout_add_rowwise(z, tmu_update, self.p_drop, self.training)
+            mark_profile("dropout_add_tri_mul_in")
             del tmu_update
-            z = dropout_add_rowwise(
+            tri_att_update = self.tri_att_start(
                 z,
-                self.tri_att_start(
-                    z,
-                    mask=pair_mask,
-                    triangle_attention=triangle_attention,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
+                mask=pair_mask,
+                triangle_attention=triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
             )
+            mark_profile("tri_att_start")
+            z = dropout_add_rowwise(z, tri_att_update, self.p_drop, self.training)
+            mark_profile("dropout_add_tri_att_start")
+            del tri_att_update
             z = z.transpose(-2, -3).contiguous()
-            z = dropout_add_rowwise(
+            mark_profile("transpose_after_start")
+            tri_att_update = self.tri_att_end(
                 z,
-                self.tri_att_end(
-                    z,
-                    mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
-                    triangle_attention=triangle_attention,
-                    inplace_safe=inplace_safe,
-                    chunk_size=chunk_size,
-                ),
-                self.p_drop,
-                self.training,
+                mask=pair_mask.transpose(-1, -2) if pair_mask is not None else None,
+                triangle_attention=triangle_attention,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
             )
+            mark_profile("tri_att_end")
+            z = dropout_add_rowwise(z, tri_att_update, self.p_drop, self.training)
+            mark_profile("dropout_add_tri_att_end")
+            del tri_att_update
             z = z.transpose(-2, -3).contiguous()
+            mark_profile("transpose_after_end")
 
             z = z + self.pair_transition(z)
+            mark_profile("pair_transition_add")
         if self.c_s > 0:
             s = s + self.attention_pair_bias(
                 a=s,
                 s=None,
                 z=z,
             )
+            mark_profile("attention_pair_bias_add")
             s = s + self.single_transition(s)
+            mark_profile("single_transition_add")
+        write_profile()
         return s, z
 
 
@@ -256,7 +509,7 @@ class PairformerStack(nn.Module):
         self.blocks_per_ckpt = blocks_per_ckpt
         self.blocks = nn.ModuleList()
 
-        for _ in range(n_blocks):
+        for block_index in range(n_blocks):
             block = PairformerBlock(
                 n_heads=n_heads,
                 c_z=c_z,
@@ -265,6 +518,7 @@ class PairformerStack(nn.Module):
                 dropout=dropout,
                 hidden_scale_up=hidden_scale_up,
             )
+            block.profile_block_index = block_index
             self.blocks.append(block)
 
     def _prep_blocks(

@@ -61,6 +61,13 @@ by manually adding argparse.Namespace to PyTorch's safe globals list.
 torch.serialization.add_safe_globals([Namespace])
 
 
+def _pairformer_row_parallel_inference_enabled() -> bool:
+    return (
+        os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
+        and DIST_WRAPPER.world_size > 1
+    )
+
+
 class InferenceRunner(object):
     """
     Runner class for AlphaFold3 model inference.
@@ -484,18 +491,22 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 new_configs = update_inference_configs(configs, data["N_token"].item())
                 runner.update_model_configs(new_configs)
                 prediction = runner.predict(data)
-                runner.dumper.dump(
-                    dataset_name="",
-                    pdb_id=sample_name,
-                    seed=seed,
-                    pred_dict=prediction,
-                    atom_array=atom_array,
-                    entity_poly_type={
-                        k: v
-                        for k, v in data["entity_poly_type"].items()
-                        if v != "non-polymer"
-                    },
-                )
+                if (
+                    not _pairformer_row_parallel_inference_enabled()
+                    or DIST_WRAPPER.rank == 0
+                ):
+                    runner.dumper.dump(
+                        dataset_name="",
+                        pdb_id=sample_name,
+                        seed=seed,
+                        pred_dict=prediction,
+                        atom_array=atom_array,
+                        entity_poly_type={
+                            k: v
+                            for k, v in data["entity_poly_type"].items()
+                            if v != "non-polymer"
+                        },
+                    )
                 t2_end = time.time()
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "

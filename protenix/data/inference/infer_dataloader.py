@@ -51,16 +51,24 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
     inference_dataset = InferenceDataset(
         configs=configs,
     )
-    sampler = DistributedSampler(
-        dataset=inference_dataset,
-        num_replicas=DIST_WRAPPER.world_size,
-        rank=DIST_WRAPPER.rank,
-        shuffle=False,
+    cooperative_row_parallel = (
+        os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
+        and DIST_WRAPPER.world_size > 1
     )
+    if cooperative_row_parallel:
+        sampler = None
+    else:
+        sampler = DistributedSampler(
+            dataset=inference_dataset,
+            num_replicas=DIST_WRAPPER.world_size,
+            rank=DIST_WRAPPER.rank,
+            shuffle=False,
+        )
     dataloader = DataLoader(
         dataset=inference_dataset,
         batch_size=1,
         sampler=sampler,
+        shuffle=False,
         collate_fn=collate_fn_identity,
         num_workers=configs.num_workers,
     )
