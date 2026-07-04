@@ -660,7 +660,7 @@ iters = 1
 - `PROTENIX_PAIRFORMER_ROW_PARALLEL=1` 且 `WORLD_SIZE>1` 时，inference dataloader 在纯 MP 模式下不再使用 `DistributedSampler` 分片。
 - 同一个 MP group 内的 rank 按相同顺序处理相同 sample，确保 Pairformer collectives 中每个 rank 都在同一个样本上。
 - row-parallel 模式下只允许 MP group leader 执行 `runner.dumper.dump(...)`，避免同组 rank 写同一份结果；DP x MP 模式下每个 MP group leader 负责各自 DP shard 的输出。
-- 默认只在 `N_token >= 768` 时启用 row-parallel；可用 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N` 覆盖，设为 `0` 表示所有 shape 都尝试启用。
+- 默认只在 `N_token >= 512` 时启用 row-parallel；可用 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N` 覆盖，设为 `0` 表示所有 shape 都尝试启用。
 
 4 卡 smoke 命令核心：
 
@@ -717,7 +717,7 @@ python runner/batch_inference.py \
 - 这是第一个真实 `runner/batch_inference.py` 4 卡合作式 row-parallel smoke。
 - `cycle=1, step=1, sample=1` 是功能 smoke，不是最终性能配置。
 - 长序列 7wux 在真实 batch 流程中已经从 `19.22s` 降到 `8.75s`。
-- 小样本 7r6r 会被 4 卡通信、进程调度、复制模块开销反超；当前接入已经加默认 `N_token >= 768` 阈值，避免短序列误走 row-parallel。
+- 小样本 7r6r 会被 4 卡通信、进程调度、复制模块开销反超；当前接入已经加默认 `N_token >= 512` 阈值，避免短序列误走 row-parallel，同时覆盖 7pzb 这类中等 N case。
 - 更接近真实性能的 7wux-only reduced run 已完成，配置为 `cycle=10, step=1, sample=1`。完整 `step=200` 仍会被 diffusion replicated work 稀释；但默认 `N_sample=5` sample parallel 已验证无明显收益，后续应看 diffusion transformer 内部并行。
 
 7wux-only reduced 结果：
@@ -1202,7 +1202,7 @@ benchmarks/bench_c500_collectives.py
 ### P1：4GPU Pairformer row-parallel + Diffusion Ulysses SP
 
 - 这是当前主线，使用单个 4 卡 island。
-- Pairformer 沿 token row 维切分 z-heavy 子图，`PROTENIX_PAIRFORMER_ROW_PARALLEL=1` opt-in，默认只在 `N_token >= 768` 时启用。
+- Pairformer 沿 token row 维切分 z-heavy 子图，`PROTENIX_PAIRFORMER_ROW_PARALLEL=1` opt-in，默认只在 `N_token >= 512` 时启用。
 - DiffusionTransformer 使用 Ulysses sequence parallel，`PROTENIX_DIFFUSION_ULYSSES_SP=1` opt-in，配合 rank-local pair-bias cache。
 - rank0 执行旧 MSA 转换、input preprocessing 和 dataloader featurization，再广播 batch 给其他 rank，避免多 rank 重复做 CPU/input 工作。
 - 完整三组默认配置已跑通：总 job 约 `239.38s`，最大 7wux model forward 约 `149.05s`。
@@ -1234,7 +1234,7 @@ benchmarks/bench_c500_collectives.py
 
 ```bash
 PROTENIX_PAIRFORMER_ROW_PARALLEL=1
-PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=768
+PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512
 PROTENIX_DIFFUSION_ULYSSES_SP=1
 PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1
 PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
@@ -1441,3 +1441,25 @@ WMMA_VERSION=v9
   - rank0 model forward `17.56s`
   - top-level profile：`get_pairformer_output 6.22-6.27s`，`sample_diffusion ~6.20s`，`confidence_head ~2.97s`
   - 对比上一轮 `get_pairformer_output 6.91-6.97s`，收益主要落在 Pairformer。
+
+2026-07-04 默认配置回归与 row-parallel 阈值更新：
+
+- 4GPU 7wux 默认配置，`cycle=10, step=200, sample=5, enable_fusion=True`：
+  - rank0 model forward `140.87s`
+  - top-level profile：`get_pairformer_output 55.7-56.1s`，`sample_diffusion 78.3-79.0s`
+  - 对比上一轮 4GPU 默认 7wux `149.05s / Pairformer 68.36s`，收益主要来自 Pairformer。
+- 4GPU 三组默认配置，`PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=768` 时：
+  - rank0 job `235.60s`
+  - 7r6r forward `22.22s`
+  - 7wux forward `135.54s`
+  - 7pzb forward `56.42s`
+  - 7pzb 因 `N_token=600 < 768` 未启用 row-parallel，Pairformer 约 `26.5s`，明显偏慢。
+- 单独测试 7pzb，`PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512`：
+  - rank0 model forward `47.72s`
+  - top-level profile：`get_pairformer_output 14.6-14.7s`，`sample_diffusion 29.8-30.9s`
+  - 说明 7pzb 这类中等 N case 应启用 row-parallel。
+- 单独测试 7r6r，默认阈值 512：
+  - rank0 model forward `22.31s`
+  - Pairformer `5.0-5.3s`
+  - `N_token=245` 仍低于阈值，没有观察到短序列回退。
+- 因此默认 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N` 从 `768` 下调到 `512`。

@@ -62,7 +62,7 @@ def _pairformer_row_parallel_enabled(
 ) -> bool:
     if os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") != "1":
         return False
-    min_n = int(os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N", "768"))
+    min_n = int(os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N", "512"))
     if min_n > 0 and z.shape[-3] < min_n:
         return False
     if training or torch.is_grad_enabled():
