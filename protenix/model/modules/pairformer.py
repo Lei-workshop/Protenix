@@ -49,6 +49,10 @@ def _pairformer_profile_path() -> Optional[str]:
     return os.environ.get("PAIRFORMER_PROFILE_LOG")
 
 
+def _pairformer_trimul_profile_path() -> Optional[str]:
+    return os.environ.get("PAIRFORMER_TRIMUL_PROFILE_LOG")
+
+
 def _pairformer_sync_if_needed(enabled: bool, ref: torch.Tensor) -> None:
     if enabled and ref.is_cuda:
         torch.cuda.synchronize(ref.device)
@@ -135,18 +139,110 @@ def _pairformer_trimul_update_rows(
     mask: torch.Tensor,
     start: int,
     end: int,
+    *,
+    rank: Optional[int] = None,
+    world: Optional[int] = None,
+    rows: Optional[int] = None,
+    block_index: Optional[int] = None,
 ) -> torch.Tensor:
+    profile_log = _pairformer_trimul_profile_path()
+    if profile_log is None:
+        z_norm = module.layer_norm_in(z)
+        a, b = _pairformer_trimul_project_a_b(module, z_norm, mask)
+        if module._outgoing:
+            x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
+        else:
+            a_t = a.transpose(1, 2).contiguous()
+            x = torch.einsum("bikc,bkjc->bijc", a_t[:, start:end], b)
+        x = module.layer_norm_out(x)
+        x = module.linear_z(x)
+        g = torch.sigmoid(module.linear_g(z_norm[:, start:end]))
+        return x * g
+
+    timings_ms: dict[str, float] = {}
+
+    _pairformer_sync_if_needed(True, z)
+    t_last = time.perf_counter()
+
+    def mark_profile(name: str, ref: torch.Tensor) -> None:
+        nonlocal t_last
+        _pairformer_sync_if_needed(True, ref)
+        now = time.perf_counter()
+        timings_ms[name] = timings_ms.get(name, 0.0) + (now - t_last) * 1000.0
+        t_last = now
+
+    direction = "outgoing" if module._outgoing else "incoming"
+    mask = mask.unsqueeze(-1)
+    mark_profile("mask_unsqueeze", mask)
+
     z_norm = module.layer_norm_in(z)
-    a, b = _pairformer_trimul_project_a_b(module, z_norm, mask)
+    mark_profile("layer_norm_in", z_norm)
+
+    a_g = module.linear_a_g(z_norm)
+    mark_profile("linear_a_g", a_g)
+    a_g = torch.sigmoid(a_g)
+    mark_profile("sigmoid_a_g", a_g)
+    a = mask * a_g
+    mark_profile("mask_a_g", a)
+    a_p = module.linear_a_p(z_norm)
+    mark_profile("linear_a_p", a_p)
+    a = a * a_p
+    mark_profile("mul_a_projection", a)
+
+    b_g = module.linear_b_g(z_norm)
+    mark_profile("linear_b_g", b_g)
+    b_g = torch.sigmoid(b_g)
+    mark_profile("sigmoid_b_g", b_g)
+    b = mask * b_g
+    mark_profile("mask_b_g", b)
+    b_p = module.linear_b_p(z_norm)
+    mark_profile("linear_b_p", b_p)
+    b = b * b_p
+    mark_profile("mul_b_projection", b)
+
     if module._outgoing:
         x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
     else:
         a_t = a.transpose(1, 2).contiguous()
+        mark_profile("incoming_a_transpose", a_t)
         x = torch.einsum("bikc,bkjc->bijc", a_t[:, start:end], b)
+    mark_profile("einsum_contraction", x)
+
     x = module.layer_norm_out(x)
+    mark_profile("layer_norm_out", x)
     x = module.linear_z(x)
-    g = torch.sigmoid(module.linear_g(z_norm[:, start:end]))
-    return x * g
+    mark_profile("linear_z", x)
+    g = module.linear_g(z_norm[:, start:end])
+    mark_profile("output_gate_linear", g)
+    g = torch.sigmoid(g)
+    mark_profile("output_gate_sigmoid", g)
+    out = x * g
+    mark_profile("output_gate_mul", out)
+
+    payload = {
+        "path": "pairformer_trimul_row_parallel",
+        "direction": direction,
+        "block_index": None if block_index is None else int(block_index),
+        "rank": None if rank is None else int(rank),
+        "world": None if world is None else int(world),
+        "start": int(start),
+        "end": int(end),
+        "rows": None if rows is None else int(rows),
+        "local_rows": int(end - start),
+        "shape_z": [int(dim) for dim in z.shape],
+        "dtype_z": str(z.dtype),
+        "device": str(z.device),
+        "c_z": int(module.c_z),
+        "c_hidden": int(module.c_hidden),
+        "timings_ms": timings_ms,
+        "total_ms": float(sum(timings_ms.values())),
+    }
+    profile_dir = os.path.dirname(profile_log)
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+    with open(profile_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+    return out
 
 
 def _pairformer_triangle_attention_shard(
@@ -310,14 +406,30 @@ class PairformerBlock(nn.Module):
                 f.write(json.dumps(payload, sort_keys=True) + "\n")
 
         update = _pairformer_trimul_update_rows(
-            self.tri_mul_out, z, pair_mask, start, end
+            self.tri_mul_out,
+            z,
+            pair_mask,
+            start,
+            end,
+            rank=rank,
+            world=world,
+            rows=rows,
+            block_index=self.profile_block_index,
         )
         mark_profile("tri_mul_out_compute", update)
         local = _pairformer_pad_rows(z[:, start:end] + update, rows)
         z = gather_profile(local, "tri_mul_out_gather")
 
         update = _pairformer_trimul_update_rows(
-            self.tri_mul_in, z, pair_mask, start, end
+            self.tri_mul_in,
+            z,
+            pair_mask,
+            start,
+            end,
+            rank=rank,
+            world=world,
+            rows=rows,
+            block_index=self.profile_block_index,
         )
         mark_profile("tri_mul_in_compute", update)
         local = _pairformer_pad_rows(z[:, start:end] + update, rows)

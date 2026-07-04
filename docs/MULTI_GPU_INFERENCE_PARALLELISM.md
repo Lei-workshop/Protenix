@@ -1463,3 +1463,28 @@ WMMA_VERSION=v9
   - Pairformer `5.0-5.3s`
   - `N_token=245` 仍低于阈值，没有观察到短序列回退。
 - 因此默认 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N` 从 `768` 下调到 `512`。
+
+2026-07-04 row-parallel tri-mul 内部分段 profile：
+
+- 新增 gated profile 环境变量：`PAIRFORMER_TRIMUL_PROFILE_LOG=/tmp/trimul.jsonl`。
+- 该 profile 只覆盖 row-parallel `tri_mul_out/in` helper，默认不开启；开启后每个方向、每个 rank 写一条 JSONL，包含 projection/gate、transpose、einsum、output linear/gate 等分段。
+- Correctness smoke：
+  - `N=128, c_s=384, autocast`
+  - 强制 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=0`
+  - `z/s max diff 0`
+- 4GPU `PairformerBlock(c_s=0), N=1218` warm profile：
+  - no-profile block time 恢复到正常量级：single `257.65ms`，row-parallel `85.86ms`
+  - profile 结果只用于阶段占比，不能和 no-profile wall time 直接比较。
+
+稳态分段聚合：
+
+| Direction | Per Record | `einsum_contraction` | `incoming_a_transpose` | 主要非 matmul 开销 |
+|---|---:|---:|---:|---|
+| outgoing | `16.58ms` | `36.8%` | n/a | layernorm/projection/gate/output 合计约 `63%` |
+| incoming | `18.82ms` | `32.8%` | `11.9%` | layernorm/projection/gate/output 合计约 `55%` |
+
+判断：
+
+- contraction/einsum 仍是最大单项，但不是绝对主导；单独替换 matmul kernel 不一定划算。
+- incoming 的显式 `a.transpose(1, 2).contiguous()` 是明确可见成本，约 `12%`，后续可看是否在 projection 阶段直接产出 incoming-friendly layout。
+- projection/gate/norm/output linear 分散但合计很大，后续如果做 kernel，应该考虑更大范围 fusion，而不是只替换 `einsum_contraction`。
