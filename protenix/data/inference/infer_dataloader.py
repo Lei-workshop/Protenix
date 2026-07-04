@@ -22,7 +22,7 @@ from typing import Any, Mapping
 
 import torch
 from biotite.structure import AtomArray
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 
 from protenix.data.esm.esm_featurizer import ESMFeaturizer
 from protenix.data.inference.json_to_feature import SampleDictToFeatures
@@ -30,7 +30,7 @@ from protenix.data.msa.msa_featurizer import InferenceMSAFeaturizer
 from protenix.data.template.template_featurizer import InferenceTemplateFeaturizer
 from protenix.data.template.template_utils import TemplateHitFeaturizer
 from protenix.data.utils import data_type_transform, make_dummy_feature
-from protenix.utils.distributed import DIST_WRAPPER
+from protenix.utils.distributed import DIST_WRAPPER, get_inference_parallel_context
 from protenix.utils.torch_utils import collate_fn_identity, dict_to_tensor
 
 logger = logging.getLogger(__name__)
@@ -51,11 +51,19 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
     inference_dataset = InferenceDataset(
         configs=configs,
     )
-    cooperative_row_parallel = (
-        os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
-        and DIST_WRAPPER.world_size > 1
-    )
-    if cooperative_row_parallel:
+    inference_parallel = get_inference_parallel_context()
+    dataset = inference_dataset
+    if inference_parallel.mp_size > 1 and inference_parallel.dp_world_size == 1:
+        sampler = None
+    elif inference_parallel.mp_size > 1:
+        dataset = Subset(
+            inference_dataset,
+            range(
+                inference_parallel.dp_rank,
+                len(inference_dataset),
+                inference_parallel.dp_world_size,
+            ),
+        )
         sampler = None
     else:
         sampler = DistributedSampler(
@@ -65,7 +73,7 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
             shuffle=False,
         )
     dataloader = DataLoader(
-        dataset=inference_dataset,
+        dataset=dataset,
         batch_size=1,
         sampler=sampler,
         shuffle=False,

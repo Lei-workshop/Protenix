@@ -42,6 +42,7 @@ from protenix.model.utils import (
     permute_final_dims,
     sample_msa_feature_dict_random_without_replacement,
 )
+from protenix.utils.distributed import get_inference_parallel_context
 
 
 def _pairformer_profile_path() -> Optional[str]:
@@ -72,7 +73,7 @@ def _pairformer_row_parallel_enabled(
     return z.is_cuda and world_size > 1
 
 
-def _pairformer_row_parallel_init(z: torch.Tensor) -> tuple[int, int]:
+def _pairformer_row_parallel_init(z: torch.Tensor) -> tuple[int, int, object]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if z.device.type == "cuda":
         torch.cuda.set_device(local_rank)
@@ -81,7 +82,8 @@ def _pairformer_row_parallel_init(z: torch.Tensor) -> tuple[int, int]:
             dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
         except TypeError:
             dist.init_process_group("nccl")
-    return dist.get_rank(), dist.get_world_size()
+    ctx = get_inference_parallel_context()
+    return ctx.mp_rank, ctx.mp_world_size, ctx.mp_group
 
 
 def _pairformer_row_bounds(n: int, world: int, rank: int) -> tuple[int, int, int]:
@@ -100,10 +102,15 @@ def _pairformer_pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     return out
 
 
-def _pairformer_gather_rows(local: torch.Tensor, n: int, world: int) -> torch.Tensor:
+def _pairformer_gather_rows(
+    local: torch.Tensor,
+    n: int,
+    world: int,
+    group: object,
+) -> torch.Tensor:
     flat = local.contiguous().view(-1)
     gathered = torch.empty((world * flat.numel(),), device=local.device, dtype=local.dtype)
-    dist.all_gather_into_tensor(gathered, flat)
+    dist.all_gather_into_tensor(gathered, flat, group=group)
     chunks = gathered.view(world, *local.shape)
     return (
         chunks.permute(1, 0, 2, 3, 4)
@@ -248,7 +255,7 @@ class PairformerBlock(nn.Module):
             z = z.unsqueeze(0)
             pair_mask = pair_mask.unsqueeze(0) if pair_mask is not None else None
 
-        rank, world = _pairformer_row_parallel_init(z)
+        rank, world, group = _pairformer_row_parallel_init(z)
         start, end, rows = _pairformer_row_bounds(z.shape[-3], world, rank)
         n = z.shape[-3]
         if pair_mask is None:
@@ -271,7 +278,7 @@ class PairformerBlock(nn.Module):
             t_last = now
 
         def gather_profile(local: torch.Tensor, name: str) -> torch.Tensor:
-            gathered = _pairformer_gather_rows(local, n, world)
+            gathered = _pairformer_gather_rows(local, n, world, group)
             mark_profile(name, gathered)
             return gathered
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -44,6 +46,85 @@ class DistWrapper:
 
 
 DIST_WRAPPER = DistWrapper()
+
+
+@dataclass
+class InferenceParallelContext:
+    mp_size: int
+    mp_rank: int
+    mp_world_size: int
+    mp_group_id: int
+    mp_group: Optional[object]
+    mp_leader_rank: int
+    dp_rank: int
+    dp_world_size: int
+
+    @property
+    def is_mp_leader(self) -> bool:
+        return self.mp_rank == 0
+
+
+_INFERENCE_PARALLEL_CONTEXT: Optional[InferenceParallelContext] = None
+
+
+def _cooperative_inference_requested() -> bool:
+    return (
+        os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
+        or os.environ.get("PROTENIX_DIFFUSION_ULYSSES_SP", "0") == "1"
+        or os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
+    )
+
+
+def _inference_mp_size() -> int:
+    value = os.environ.get("PROTENIX_INFERENCE_MP_SIZE")
+    if value is not None:
+        return int(value)
+    if DIST_WRAPPER.world_size > 1 and _cooperative_inference_requested():
+        return DIST_WRAPPER.world_size
+    return 1
+
+
+def get_inference_parallel_context() -> InferenceParallelContext:
+    global _INFERENCE_PARALLEL_CONTEXT
+    if _INFERENCE_PARALLEL_CONTEXT is not None:
+        return _INFERENCE_PARALLEL_CONTEXT
+
+    world_size = DIST_WRAPPER.world_size
+    rank = DIST_WRAPPER.rank
+    mp_size = _inference_mp_size()
+    if mp_size < 1:
+        raise ValueError(f"PROTENIX_INFERENCE_MP_SIZE must be >= 1, got {mp_size}")
+    if world_size % mp_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by PROTENIX_INFERENCE_MP_SIZE ({mp_size})"
+        )
+
+    mp_group = None
+    if mp_size > 1 and mp_size < world_size:
+        if not distributed_available():
+            raise RuntimeError("Distributed process group must be initialized before creating inference MP groups")
+        num_groups = world_size // mp_size
+        for group_id in range(num_groups):
+            ranks = list(range(group_id * mp_size, (group_id + 1) * mp_size))
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                mp_group = group
+
+    mp_group_id = rank // mp_size
+    mp_rank = rank % mp_size
+    dp_world_size = world_size // mp_size
+    ctx = InferenceParallelContext(
+        mp_size=mp_size,
+        mp_rank=mp_rank,
+        mp_world_size=mp_size,
+        mp_group_id=mp_group_id,
+        mp_group=mp_group,
+        mp_leader_rank=mp_group_id * mp_size,
+        dp_rank=mp_group_id,
+        dp_world_size=dp_world_size,
+    )
+    _INFERENCE_PARALLEL_CONTEXT = ctx
+    return ctx
 
 
 def traverse_and_aggregate(dict_list, aggregation_func=None):

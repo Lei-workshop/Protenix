@@ -32,7 +32,7 @@ from configs.configs_model_type import model_configs
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
 from protenix.model.protenix import Protenix
-from protenix.utils.distributed import DIST_WRAPPER
+from protenix.utils.distributed import DIST_WRAPPER, get_inference_parallel_context
 from protenix.utils.seed import seed_everything
 from protenix.utils.torch_utils import to_device
 from protenix.web_service.dependency_url import URL
@@ -59,13 +59,6 @@ by manually adding argparse.Namespace to PyTorch's safe globals list.
 """
 
 torch.serialization.add_safe_globals([Namespace])
-
-
-def _pairformer_row_parallel_inference_enabled() -> bool:
-    return (
-        os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
-        and DIST_WRAPPER.world_size > 1
-    )
 
 
 class InferenceRunner(object):
@@ -431,16 +424,17 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         runner (InferenceRunner): The initialized runner instance.
         configs (Any): Inference configurations.
     """
+    inference_parallel = get_inference_parallel_context()
     broadcast_data = (
         os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
-        and DIST_WRAPPER.world_size > 1
+        and inference_parallel.mp_size > 1
         and dist.is_initialized()
     )
 
     dataloader = None
     seeds = None
-    num_data = 0
-    if (not broadcast_data) or DIST_WRAPPER.rank == 0:
+    num_batches = 0
+    if (not broadcast_data) or inference_parallel.is_mp_leader:
         # Data loading
         logger.info(f"Loading data from {configs.input_json_path}")
         with open(configs.input_json_path, "r", encoding="utf-8") as f:
@@ -470,16 +464,20 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 f.write(error_message)
             return
 
-        num_data = len(dataloader.dataset)
+        num_batches = len(dataloader)
 
     if broadcast_data:
-        meta = [seeds, num_data] if DIST_WRAPPER.rank == 0 else [None, None]
-        dist.broadcast_object_list(meta, src=0)
-        seeds, num_data = meta
-        if DIST_WRAPPER.rank != 0:
+        meta = [seeds, num_batches] if inference_parallel.is_mp_leader else [None, None]
+        dist.broadcast_object_list(
+            meta,
+            src=inference_parallel.mp_leader_rank,
+            group=inference_parallel.mp_group,
+        )
+        seeds, num_batches = meta
+        if not inference_parallel.is_mp_leader:
             logger.info(
-                f"[Rank {DIST_WRAPPER.rank}] Received distributed inference metadata: "
-                f"num_data={num_data}, seeds={seeds}"
+                f"[Rank {DIST_WRAPPER.rank}] Received MP-group inference metadata: "
+                f"num_batches={num_batches}, seeds={seeds}"
             )
 
     t0_start = time.time()
@@ -487,14 +485,18 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         seed_everything(seed=seed, deterministic=configs.deterministic)
         t1_start = time.time()
         data_iter = iter(dataloader) if dataloader is not None else None
-        for batch_idx in range(num_data):
+        for batch_idx in range(num_batches):
             if broadcast_data:
-                if DIST_WRAPPER.rank == 0:
+                if inference_parallel.is_mp_leader:
                     batch = next(data_iter)
                     batch_obj = [batch]
                 else:
                     batch_obj = [None]
-                dist.broadcast_object_list(batch_obj, src=0)
+                dist.broadcast_object_list(
+                    batch_obj,
+                    src=inference_parallel.mp_leader_rank,
+                    group=inference_parallel.mp_group,
+                )
                 batch = batch_obj[0]
             else:
                 batch = next(data_iter)
@@ -515,7 +517,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     continue
 
                 logger.info(
-                    f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
+                    f"[Rank {DIST_WRAPPER.rank} ({batch_idx + 1}/{num_batches})] "
                     f"{sample_name} [seed:{seed}]: "
                     f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
                     f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
@@ -524,20 +526,17 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 runner.update_model_configs(new_configs)
                 if (
                     os.environ.get("PROTENIX_DISTRIBUTED_FORWARD_BARRIER", "0") == "1"
-                    and DIST_WRAPPER.world_size > 1
+                    and inference_parallel.mp_size > 1
                     and dist.is_initialized()
                 ):
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    dist.barrier()
+                    dist.barrier(group=inference_parallel.mp_group)
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     t2_start = time.time()
                 prediction = runner.predict(data)
-                if (
-                    not _pairformer_row_parallel_inference_enabled()
-                    or DIST_WRAPPER.rank == 0
-                ):
+                if inference_parallel.is_mp_leader:
                     runner.dumper.dump(
                         dataset_name="",
                         pdb_id=sample_name,

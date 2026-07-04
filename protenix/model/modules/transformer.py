@@ -39,6 +39,7 @@ from protenix.model.utils import (
     checkpoint_blocks,
     permute_final_dims,
 )
+from protenix.utils.distributed import get_inference_parallel_context
 
 
 def _diffusion_transformer_profile_path() -> Optional[str]:
@@ -85,10 +86,15 @@ def _sp_pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     return out
 
 
-def _sp_gather_rows(local: torch.Tensor, n: int, world: int) -> torch.Tensor:
+def _sp_gather_rows(
+    local: torch.Tensor,
+    n: int,
+    world: int,
+    group: object,
+) -> torch.Tensor:
     flat = local.contiguous().view(-1)
     gathered = torch.empty((world * flat.numel(),), device=local.device, dtype=local.dtype)
-    dist.all_gather_into_tensor(gathered, flat)
+    dist.all_gather_into_tensor(gathered, flat, group=group)
     chunks = gathered.view(world, *local.shape)
     return (
         chunks.permute(1, 0, 2, 3)
@@ -98,13 +104,13 @@ def _sp_gather_rows(local: torch.Tensor, n: int, world: int) -> torch.Tensor:
     )
 
 
-def _sp_seq2head(x: torch.Tensor, world: int) -> torch.Tensor:
+def _sp_seq2head(x: torch.Tensor, world: int, group: object) -> torch.Tensor:
     bsz, local_seq, heads, head_dim = x.shape
     shard_heads = heads // world
     send = x.reshape(bsz, local_seq, world, shard_heads, head_dim)
     send = send.permute(2, 0, 1, 3, 4).contiguous()
     recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send)
+    dist.all_to_all_single(recv, send, group=group)
     return recv.permute(1, 0, 2, 3, 4).reshape(
         bsz, world * local_seq, shard_heads, head_dim
     ).contiguous()
@@ -115,6 +121,7 @@ def _sp_seq2head_qkv(
     k: torch.Tensor,
     v: torch.Tensor,
     world: int,
+    group: object,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, local_seq, heads, head_dim = q.shape
     shard_heads = heads // world
@@ -122,20 +129,20 @@ def _sp_seq2head_qkv(
     send = packed.reshape(3, bsz, local_seq, world, shard_heads, head_dim)
     send = send.permute(3, 0, 1, 2, 4, 5).contiguous()
     recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send)
+    dist.all_to_all_single(recv, send, group=group)
     packed = recv.permute(1, 2, 0, 3, 4, 5).reshape(
         3, bsz, world * local_seq, shard_heads, head_dim
     )
     return tuple(t.contiguous() for t in packed.unbind(dim=0))
 
 
-def _sp_head2seq(x: torch.Tensor, world: int) -> torch.Tensor:
+def _sp_head2seq(x: torch.Tensor, world: int, group: object) -> torch.Tensor:
     bsz, full_seq, shard_heads, head_dim = x.shape
     local_seq = full_seq // world
     send = x.reshape(bsz, world, local_seq, shard_heads, head_dim)
     send = send.permute(1, 0, 3, 2, 4).contiguous()
     recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send)
+    dist.all_to_all_single(recv, send, group=group)
     return recv.permute(1, 3, 0, 2, 4).reshape(
         bsz, local_seq, world * shard_heads, head_dim
     ).contiguous()
@@ -675,7 +682,8 @@ class DiffusionTransformer(nn.Module):
         q_x = module.layernorm_a(a=local_a, s=local_s)
         q_local, k_local, v_local = self._ulysses_sp_project_qkv(module, q_x)
 
-        q, k, v = _sp_seq2head_qkv(q_local, k_local, v_local, world)
+        group = get_inference_parallel_context().mp_group
+        q, k, v = _sp_seq2head_qkv(q_local, k_local, v_local, world, group)
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
@@ -688,7 +696,7 @@ class DiffusionTransformer(nn.Module):
         attn_out = torch.matmul(torch.softmax(logits, dim=-1), v)
 
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous()
-        local_heads = _sp_head2seq(attn_out, world)
+        local_heads = _sp_head2seq(attn_out, world, group)
         out = module.attention._wrap_up(local_heads, q_x)
         return torch.sigmoid(module.linear_a_last(local_s)) * out
 
@@ -698,8 +706,9 @@ class DiffusionTransformer(nn.Module):
         s: torch.Tensor,
         z: torch.Tensor,
     ) -> torch.Tensor:
-        world = dist.get_world_size()
-        rank = dist.get_rank()
+        inference_parallel = get_inference_parallel_context()
+        world = inference_parallel.mp_world_size
+        rank = inference_parallel.mp_rank
         if self.n_heads % world != 0:
             raise ValueError(
                 f"Diffusion Ulysses SP requires n_heads ({self.n_heads}) divisible by world ({world})"
@@ -716,7 +725,7 @@ class DiffusionTransformer(nn.Module):
             local_a = local_attn + local_a
             local_a = block.conditioned_transition_block(a=local_a, s=local_s) + local_a
 
-        return _sp_gather_rows(local_a, n, world)
+        return _sp_gather_rows(local_a, n, world, inference_parallel.mp_group)
 
     def forward(
         self,
