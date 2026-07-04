@@ -141,7 +141,8 @@ def _pairformer_trimul_update_rows(
     if module._outgoing:
         x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
     else:
-        x = torch.einsum("bkic,bkjc->bijc", a[:, :, start:end], b)
+        a_t = a.transpose(1, 2).contiguous()
+        x = torch.einsum("bikc,bkjc->bijc", a_t[:, start:end], b)
     x = module.layer_norm_out(x)
     x = module.linear_z(x)
     g = torch.sigmoid(module.linear_g(z_norm[:, start:end]))

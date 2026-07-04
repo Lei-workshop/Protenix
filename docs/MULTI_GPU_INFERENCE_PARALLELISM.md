@@ -1422,3 +1422,22 @@ WMMA_VERSION=v9
   - rank0 model forward `19.02s`
   - top-level profile：`get_pairformer_output 6.93-6.97s`，`sample_diffusion 6.16s`，`confidence_head 3.58s`
 - 结论：删除 matmul POC 后，正式多卡路径保持健康，没有观察到性能回退。
+
+2026-07-04 tri_mul_in layout 优化：
+
+- 保持多 GPU 维度仍按 output row `i` 切分，只改 row-parallel `tri_mul_in` 内部 layout。
+- 原 incoming 公式 `out[i,j,c] = sum_k a[k,i,c] * b[k,j,c]` 在 row-shard 下需要取 `a[:, :, i_rows]` column slice，layout 不如 outgoing 的 `a[:, i_rows, :]`。
+- 当前改为先构造 `a_t = a.transpose(1, 2).contiguous()`，再用 outgoing 形态计算：`einsum("bikc,bkjc->bijc", a_t[:, i_rows], b)`。数学不变，但 local shard 访问变成连续 row slice。
+- 4GPU `PairformerBlock(c_s=0), N=1218` benchmark：
+  - single block `259.10ms`
+  - row-parallel block `84.35ms`
+  - 约 `3.07x`，比历史真实 block `~97.7ms / 2.64x` 明显改善。
+- 稳态 profile 中 `tri_mul_in_compute` 约 `16.6-17.0ms`；历史 subset profile 中该段约 `24.9ms`。
+- Correctness：
+  - `N=128, c_s=0`：`z max diff 0`
+  - `N=128, c_s=384, autocast`：`z/s max diff 0`
+- 4GPU 7wux reduced 端到端：
+  - 配置：`cycle=1, step=40, sample=5, enable_fusion=False`
+  - rank0 model forward `17.56s`
+  - top-level profile：`get_pairformer_output 6.22-6.27s`，`sample_diffusion ~6.20s`，`confidence_head ~2.97s`
+  - 对比上一轮 `get_pairformer_output 6.91-6.97s`，收益主要落在 Pairformer。
