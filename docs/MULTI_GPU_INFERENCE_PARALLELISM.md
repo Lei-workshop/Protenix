@@ -1519,3 +1519,22 @@ WMMA_VERSION=v9
   - rank0 model forward `16.88s`
   - top-level profile：`get_pairformer_output 5.79-5.85s`，`sample_diffusion ~6.06s`
   - 对比上一版 `17.56s / get_pairformer_output 6.22-6.27s`，收益继续落在 Pairformer。
+
+2026-07-05 b 侧和 post 侧融合收益上限评估：
+
+- 基于 `PAIRFORMER_TRIMUL_PROFILE_LOG` 的 4GPU `PairformerBlock(c_s=0), N=1218` warm profile。
+- 当前 local-`a` 版本里，contraction/einsum 仍保持 torch/mcBLAS 路径，不作为当前优化对象。
+
+local-`a` 后稳态占比：
+
+| Direction | Per Record | Contraction | b linear | b elementwise | post total | b side total |
+|---|---:|---:|---:|---:|---:|---:|
+| outgoing | `14.17ms` | `42.7%` | `8.9%` | `17.1%` | `6.8%` | `26.0%` |
+| incoming | `14.42ms` | `42.0%` | `8.8%` | `17.4%` | `6.7%` | `26.2%` |
+
+融合上限判断：
+
+- 只融合 b 侧 elementwise 和 post elementwise 的理论上限约为每 record `~3.0ms`，占 `~21%`。真实 Triton/CUDA POC 不可能完全拿满，因为还会有 kernel launch、读写和编译开销。
+- post 侧总量只有 `~6-7%`，单独优化优先级不高。
+- b 侧总量约 `26%`，是下一步更值得看的对象；但其中 `linear_b_g/linear_b_p` 仍是 linear/GEMM，不应直接替换 mcBLAS。更合理的方向是融合 b projection 后的 sigmoid/mask/mul，或探索减少 b 中间 tensor materialize。
+- 因此下一步如果写 Triton/CUDA POC，应优先做 b 侧 pre-matmul fusion，上限评估清楚后再决定是否推广到 post 侧。
