@@ -1538,3 +1538,22 @@ local-`a` 后稳态占比：
 - post 侧总量只有 `~6-7%`，单独优化优先级不高。
 - b 侧总量约 `26%`，是下一步更值得看的对象；但其中 `linear_b_g/linear_b_p` 仍是 linear/GEMM，不应直接替换 mcBLAS。更合理的方向是融合 b projection 后的 sigmoid/mask/mul，或探索减少 b 中间 tensor materialize。
 - 因此下一步如果写 Triton/CUDA POC，应优先做 b 侧 pre-matmul fusion，上限评估清楚后再决定是否推广到 post 侧。
+
+2026-07-05 PyTorch 原地 elementwise POC：
+
+- 尝试把 `_pairformer_trimul_project_a/b` 中的 `sigmoid + mask multiply + projection multiply` 改成原地形式：
+  - `linear_*_g`
+  - `sigmoid_()`
+  - `mul_(mask)`
+  - `mul_(linear_*_p(...))`
+- 不改变 `linear_*` 和 `einsum` / torch-mcBLAS contraction。
+- Correctness：
+  - `N=128, c_s=384, autocast`
+  - 强制 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=0`
+  - `z/s max diff 0`
+- 4GPU `PairformerBlock(c_s=0), N=1218` no-profile benchmark：
+  - single block `257.48ms`
+  - row-parallel block `75.82ms`
+  - 对比 local-`a` 版本 `76.07ms`，只有极小改善。
+- internal profile 中 b elementwise 仍约 `17%`，post elementwise 仍约 `3.7%`；PyTorch 原地写法没有真正融合 kernel，因此不能显著降低 elementwise launch/读写成本。
+- 结论：该 POC 可保留为低风险小清理，但如果继续优化 b/post elementwise，需要 Triton/CUDA fused elementwise kernel，而不是只改 PyTorch 表达式。
