@@ -1556,4 +1556,4 @@ local-`a` 后稳态占比：
   - row-parallel block `75.82ms`
   - 对比 local-`a` 版本 `76.07ms`，只有极小改善。
 - internal profile 中 b elementwise 仍约 `17%`，post elementwise 仍约 `3.7%`；PyTorch 原地写法没有真正融合 kernel，因此不能显著降低 elementwise launch/读写成本。
-- 结论：该 POC 可保留为低风险小清理，但如果继续优化 b/post elementwise，需要 Triton/CUDA fused elementwise kernel，而不是只改 PyTorch 表达式。
+- 结论：该 POC 效果不明显，代码不保留；如果继续优化 b/post elementwise，需要 Triton/CUDA fused elementwise kernel，而不是只改 PyTorch 表达式。

@@ -125,18 +125,16 @@ def _pairformer_gather_rows(
 
 
 def _pairformer_trimul_project_a(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
-    a = module.linear_a_g(z_norm)
-    a.sigmoid_()
-    a.mul_(mask.unsqueeze(-1))
-    a.mul_(module.linear_a_p(z_norm))
+    mask = mask.unsqueeze(-1)
+    a = mask * torch.sigmoid(module.linear_a_g(z_norm))
+    a = a * module.linear_a_p(z_norm)
     return a
 
 
 def _pairformer_trimul_project_b(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
-    b = module.linear_b_g(z_norm)
-    b.sigmoid_()
-    b.mul_(mask.unsqueeze(-1))
-    b.mul_(module.linear_b_p(z_norm))
+    mask = mask.unsqueeze(-1)
+    b = mask * torch.sigmoid(module.linear_b_g(z_norm))
+    b = b * module.linear_b_p(z_norm)
     return b
 
 
@@ -198,24 +196,24 @@ def _pairformer_trimul_update_rows(
 
     a_g = module.linear_a_g(a_input)
     mark_profile("linear_a_g", a_g)
-    a_g.sigmoid_()
+    a_g = torch.sigmoid(a_g)
     mark_profile("sigmoid_a_g", a_g)
-    a_g.mul_(a_mask.unsqueeze(-1))
-    mark_profile("mask_a_g", a_g)
+    a = a_mask.unsqueeze(-1) * a_g
+    mark_profile("mask_a_g", a)
     a_p = module.linear_a_p(a_input)
     mark_profile("linear_a_p", a_p)
-    a = a_g.mul_(a_p)
+    a = a * a_p
     mark_profile("mul_a_projection", a)
 
     b_g = module.linear_b_g(z_norm)
     mark_profile("linear_b_g", b_g)
-    b_g.sigmoid_()
+    b_g = torch.sigmoid(b_g)
     mark_profile("sigmoid_b_g", b_g)
-    b_g.mul_(mask.unsqueeze(-1))
-    mark_profile("mask_b_g", b_g)
+    b = mask.unsqueeze(-1) * b_g
+    mark_profile("mask_b_g", b)
     b_p = module.linear_b_p(z_norm)
     mark_profile("linear_b_p", b_p)
-    b = b_g.mul_(b_p)
+    b = b * b_p
     mark_profile("mul_b_projection", b)
 
     x = torch.einsum("bikc,bkjc->bijc", a, b)
