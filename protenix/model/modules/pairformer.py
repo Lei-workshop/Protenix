@@ -124,13 +124,18 @@ def _pairformer_gather_rows(
     )
 
 
-def _pairformer_trimul_project_a_b(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
+def _pairformer_trimul_project_a(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
     mask = mask.unsqueeze(-1)
     a = mask * torch.sigmoid(module.linear_a_g(z_norm))
     a = a * module.linear_a_p(z_norm)
+    return a
+
+
+def _pairformer_trimul_project_b(module: nn.Module, z_norm: torch.Tensor, mask: torch.Tensor):
+    mask = mask.unsqueeze(-1)
     b = mask * torch.sigmoid(module.linear_b_g(z_norm))
     b = b * module.linear_b_p(z_norm)
-    return a, b
+    return b
 
 
 def _pairformer_trimul_update_rows(
@@ -148,12 +153,15 @@ def _pairformer_trimul_update_rows(
     profile_log = _pairformer_trimul_profile_path()
     if profile_log is None:
         z_norm = module.layer_norm_in(z)
-        a, b = _pairformer_trimul_project_a_b(module, z_norm, mask)
         if module._outgoing:
-            x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
+            a_input = z_norm[:, start:end]
+            a_mask = mask[:, start:end]
         else:
-            a_t = a.transpose(1, 2).contiguous()
-            x = torch.einsum("bikc,bkjc->bijc", a_t[:, start:end], b)
+            a_input = z_norm[:, :, start:end].transpose(1, 2).contiguous()
+            a_mask = mask[:, :, start:end].transpose(1, 2).contiguous()
+        a = _pairformer_trimul_project_a(module, a_input, a_mask)
+        b = _pairformer_trimul_project_b(module, z_norm, mask)
+        x = torch.einsum("bikc,bkjc->bijc", a, b)
         x = module.layer_norm_out(x)
         x = module.linear_z(x)
         g = torch.sigmoid(module.linear_g(z_norm[:, start:end]))
@@ -172,19 +180,27 @@ def _pairformer_trimul_update_rows(
         t_last = now
 
     direction = "outgoing" if module._outgoing else "incoming"
-    mask = mask.unsqueeze(-1)
     mark_profile("mask_unsqueeze", mask)
 
     z_norm = module.layer_norm_in(z)
     mark_profile("layer_norm_in", z_norm)
 
-    a_g = module.linear_a_g(z_norm)
+    if module._outgoing:
+        a_input = z_norm[:, start:end]
+        a_mask = mask[:, start:end]
+    else:
+        a_input = z_norm[:, :, start:end].transpose(1, 2).contiguous()
+        mark_profile("incoming_a_input_transpose", a_input)
+        a_mask = mask[:, :, start:end].transpose(1, 2).contiguous()
+        mark_profile("incoming_a_mask_transpose", a_mask)
+
+    a_g = module.linear_a_g(a_input)
     mark_profile("linear_a_g", a_g)
     a_g = torch.sigmoid(a_g)
     mark_profile("sigmoid_a_g", a_g)
-    a = mask * a_g
+    a = a_mask.unsqueeze(-1) * a_g
     mark_profile("mask_a_g", a)
-    a_p = module.linear_a_p(z_norm)
+    a_p = module.linear_a_p(a_input)
     mark_profile("linear_a_p", a_p)
     a = a * a_p
     mark_profile("mul_a_projection", a)
@@ -193,19 +209,14 @@ def _pairformer_trimul_update_rows(
     mark_profile("linear_b_g", b_g)
     b_g = torch.sigmoid(b_g)
     mark_profile("sigmoid_b_g", b_g)
-    b = mask * b_g
+    b = mask.unsqueeze(-1) * b_g
     mark_profile("mask_b_g", b)
     b_p = module.linear_b_p(z_norm)
     mark_profile("linear_b_p", b_p)
     b = b * b_p
     mark_profile("mul_b_projection", b)
 
-    if module._outgoing:
-        x = torch.einsum("bikc,bkjc->bijc", a[:, start:end], b)
-    else:
-        a_t = a.transpose(1, 2).contiguous()
-        mark_profile("incoming_a_transpose", a_t)
-        x = torch.einsum("bikc,bkjc->bijc", a_t[:, start:end], b)
+    x = torch.einsum("bikc,bkjc->bijc", a, b)
     mark_profile("einsum_contraction", x)
 
     x = module.layer_norm_out(x)

@@ -1488,3 +1488,34 @@ WMMA_VERSION=v9
 - contraction/einsum 仍是最大单项，但不是绝对主导；单独替换 matmul kernel 不一定划算。
 - incoming 的显式 `a.transpose(1, 2).contiguous()` 是明确可见成本，约 `12%`，后续可看是否在 projection 阶段直接产出 incoming-friendly layout。
 - projection/gate/norm/output linear 分散但合计很大，后续如果做 kernel，应该考虑更大范围 fusion，而不是只替换 `einsum_contraction`。
+
+2026-07-05 local-`a` projection 优化：
+
+- 保持 `einsum` / torch-mcBLAS contraction 不变，只减少 contraction 前的 `a` 侧 projection 和 layout round trip。
+- 旧 row-parallel helper 会先对 full `z_norm[N,N,C]` 生成 full `a[N,N,C_hidden]`，然后：
+  - outgoing 只使用 `a[:, i_rows]`
+  - incoming 再做 full `a.transpose(1, 2).contiguous()` 后使用 `a_t[:, i_rows]`
+- 新实现只生成本 rank 需要的 local `a`：
+  - outgoing: `a_input = z_norm[:, i_rows]`
+  - incoming: `a_input = z_norm[:, :, i_rows].transpose(1, 2).contiguous()`
+  - `b` 仍保持 full projection，matmul/einsum 不变。
+- Correctness：
+  - `N=128, c_s=384, autocast`
+  - 强制 `PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=0`
+  - `z/s max diff 0`
+- 4GPU `PairformerBlock(c_s=0), N=1218` no-profile benchmark：
+  - single block `257.72ms`
+  - row-parallel block `76.07ms`
+  - 对比上一版 row-parallel `84-86ms`，继续下降约 `10-12%`。
+- warm internal profile：
+
+| Direction | Per Record | `einsum_contraction` | local layout cost | `linear_a_*` cost |
+|---|---:|---:|---:|---:|
+| outgoing | `14.17ms` | `42.7%` | n/a | `~3.2%` |
+| incoming | `14.42ms` | `42.0%` | `incoming_a_input/mask_transpose ~1.8%` | `~3.0%` |
+
+- 4GPU 7wux reduced 端到端：
+  - 配置：`cycle=1, step=40, sample=5, enable_fusion=False`
+  - rank0 model forward `16.88s`
+  - top-level profile：`get_pairformer_output 5.79-5.85s`，`sample_diffusion ~6.06s`
+  - 对比上一版 `17.56s / get_pairformer_output 6.22-6.27s`，收益继续落在 Pairformer。
