@@ -1349,7 +1349,7 @@ all profile env disabled
 验证配置：
 
 ```text
-input=examples/example_7wux.json
+input=single-case json for 7r6r / 7wux / 7pzb
 cycle=10
 step=200
 sample=5
@@ -1366,10 +1366,23 @@ all profile env disabled
 
 日志确认 non-leader ranks 收到 preprocessed JSON 和 MP-group metadata，说明自动 data broadcast 生效。
 
-| GPUs | rank0 model forward | rank0 job | 说明 |
-|---:|---:|---:|---|
-| 2 | `125.09s` | `141.83s` | 补齐开启 Diffusion SP 后的 2GPU 7wux 数据 |
-| 4 | `86.66s` | `103.04s` | 与前序 4GPU `enable_fusion=False` 7wux `85-87s` 区间一致 |
+single-case no-profile 结果：
+
+| Case | GPUs | rank0 model forward | rank0 job |
+|---|---:|---:|---:|
+| 7r6r | 2 | `17.33s` | `24.01s` |
+| 7r6r | 4 | `16.38s` | `22.70s` |
+| 7wux | 2 | `125.09s` | `141.83s` |
+| 7wux | 4 | `86.66s` | `103.04s` |
+| 7pzb | 2 | `39.50s` | `49.84s` |
+| 7pzb | 4 | `30.66s` | `40.51s` |
+
+判断：
+
+- 4GPU 7wux 与前序 `enable_fusion=False` 7wux `85-87s` 区间一致，证明 auto broadcast/barrier 没有引入性能回退。
+- 2GPU 开启 Diffusion SP 后，7wux single-case forward 从旧三 case数据中的 `162.50s` 降到 `125.09s`，说明 diffusion SP 对 2GPU 也有效。
+- 7r6r 是短序列，2GPU/4GPU 差距很小；4GPU 性能略好但卡时不划算。
+- 7pzb 从 2GPU 到 4GPU 仍有收益，forward `39.50s -> 30.66s`。
 
 2026-07-06 1/2/4 卡性价比更新：2GPU/4GPU 配置与 1GPU 相同，只增加协同推理环境变量并把 `torchrun --nproc_per_node` 分别设置为 `2` / `4`。2GPU/4GPU 日志确认 rank0-only MSA/preprocess 和 dataloader broadcast 生效。所有 profile env 均关闭，包括 `PROTENIX_PROFILE_LOG`、`TRIATT_PROFILE_LOG`、`PAIRFORMER_PROFILE_LOG`、`PAIRFORMER_TRIMUL_PROFILE_LOG`、`DIFFUSION_PROFILE_LOG`、`DIFFUSION_TRANSFORMER_PROFILE_LOG`。
 
