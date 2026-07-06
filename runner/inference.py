@@ -32,7 +32,12 @@ from configs.configs_model_type import model_configs
 from protenix.config.config import parse_configs, parse_sys_args
 from protenix.data.inference.infer_dataloader import get_inference_dataloader
 from protenix.model.protenix import Protenix
-from protenix.utils.distributed import DIST_WRAPPER, get_inference_parallel_context
+from protenix.utils.distributed import (
+    DIST_WRAPPER,
+    distributed_data_broadcast_enabled,
+    distributed_forward_barrier_enabled,
+    get_inference_parallel_context,
+)
 from protenix.utils.seed import seed_everything
 from protenix.utils.torch_utils import to_device
 from protenix.web_service.dependency_url import URL
@@ -426,8 +431,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     """
     inference_parallel = get_inference_parallel_context()
     broadcast_data = (
-        os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
-        and inference_parallel.mp_size > 1
+        distributed_data_broadcast_enabled(inference_parallel.mp_size)
         and dist.is_initialized()
     )
 
@@ -525,8 +529,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 new_configs = update_inference_configs(configs, data["N_token"].item())
                 runner.update_model_configs(new_configs)
                 if (
-                    os.environ.get("PROTENIX_DISTRIBUTED_FORWARD_BARRIER", "0") == "1"
-                    and inference_parallel.mp_size > 1
+                    distributed_forward_barrier_enabled(inference_parallel.mp_size)
                     and dist.is_initialized()
                 ):
                     if torch.cuda.is_available():

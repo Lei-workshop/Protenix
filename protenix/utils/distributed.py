@@ -67,10 +67,28 @@ class InferenceParallelContext:
 _INFERENCE_PARALLEL_CONTEXT: Optional[InferenceParallelContext] = None
 
 
-def _cooperative_inference_requested() -> bool:
+def _env_flag(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean env flag, got {value!r}")
+
+
+def _model_parallel_inference_requested() -> bool:
     return (
         os.environ.get("PROTENIX_PAIRFORMER_ROW_PARALLEL", "0") == "1"
         or os.environ.get("PROTENIX_DIFFUSION_ULYSSES_SP", "0") == "1"
+    )
+
+
+def _cooperative_inference_requested() -> bool:
+    return (
+        _model_parallel_inference_requested()
         or os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
     )
 
@@ -125,6 +143,24 @@ def get_inference_parallel_context() -> InferenceParallelContext:
     )
     _INFERENCE_PARALLEL_CONTEXT = ctx
     return ctx
+
+
+def distributed_data_broadcast_enabled(mp_size: Optional[int] = None) -> bool:
+    explicit = _env_flag("PROTENIX_DISTRIBUTED_DATA_BROADCAST")
+    if mp_size is None:
+        mp_size = _inference_mp_size()
+    if explicit is not None:
+        return explicit and mp_size > 1
+    return _model_parallel_inference_requested() and mp_size > 1
+
+
+def distributed_forward_barrier_enabled(mp_size: Optional[int] = None) -> bool:
+    explicit = _env_flag("PROTENIX_DISTRIBUTED_FORWARD_BARRIER")
+    if mp_size is None:
+        mp_size = _inference_mp_size()
+    if explicit is not None:
+        return explicit and mp_size > 1
+    return _model_parallel_inference_requested() and mp_size > 1
 
 
 def traverse_and_aggregate(dict_list, aggregation_func=None):

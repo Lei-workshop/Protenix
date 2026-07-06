@@ -37,7 +37,10 @@ from protenix.config.config import parse_configs
 from protenix.data.inference.json_maker import cif_to_input_json
 from protenix.data.inference.json_parser import lig_file_to_atom_info
 from protenix.data.utils import pdb_to_cif
-from protenix.utils.distributed import DIST_WRAPPER
+from protenix.utils.distributed import (
+    DIST_WRAPPER,
+    distributed_data_broadcast_enabled,
+)
 from protenix.utils.logger import get_logger
 from protenix.version import __version__
 from rdkit import Chem
@@ -187,11 +190,11 @@ def preprocess_input_distributed(
     """
     Run input preprocessing once on rank 0 and broadcast the resulting JSON path.
 
-    This is paired with PROTENIX_DISTRIBUTED_DATA_BROADCAST, where rank 0 also
-    builds and broadcasts dataloader batches to avoid repeated CPU preprocessing.
+    This is paired with distributed data broadcast, where rank 0 also builds and
+    broadcasts dataloader batches to avoid repeated CPU preprocessing.
     """
     broadcast_preprocess = (
-        os.environ.get("PROTENIX_DISTRIBUTED_DATA_BROADCAST", "0") == "1"
+        distributed_data_broadcast_enabled()
         and DIST_WRAPPER.world_size > 1
         and dist.is_available()
         and dist.is_initialized()

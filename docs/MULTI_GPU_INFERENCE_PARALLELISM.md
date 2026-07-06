@@ -1056,17 +1056,18 @@ benchmarks/bench_protenix_diffusion_transformer_ulysses_integration.py
 
 ### sample_diffusion reduced 接入结果：2026-07-03
 
-为避免 4 个 ranks 各自 dataloader/featurization 导致 profile 污染，新增两个实验 env：
+为避免 4 个 ranks 各自 dataloader/featurization 导致 profile 污染，当时新增两个实验 env：
 
 ```text
 PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1
 PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
 ```
 
-当前实现：
+当前实现语义：
 
-- `PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1`：在 `runner.predict(data)` 前 barrier 对齐，并重置 model forward 计时；
-- `PROTENIX_DISTRIBUTED_DATA_BROADCAST=1`：rank0 创建 dataloader、featurize batch，再通过 `dist.broadcast_object_list` 把 batch 发给 rank1/2/3；
+- `PROTENIX_DISTRIBUTED_FORWARD_BARRIER`：在 `runner.predict(data)` 前 barrier 对齐，并重置 model forward 计时；
+- `PROTENIX_DISTRIBUTED_DATA_BROADCAST`：rank0 创建 dataloader、featurize batch，再通过 `dist.broadcast_object_list` 把 batch 发给 rank1/2/3；
+- 2026-07-06 后，若 `PROTENIX_PAIRFORMER_ROW_PARALLEL=1` 或 `PROTENIX_DIFFUSION_ULYSSES_SP=1` 且 `mp_size>1`，上述两项默认自动启用；可显式设为 `0` 关闭；
 - checkpoint 仍然每个 rank 自己 load，这符合多卡推理需求；
 - 当前还有一个上游问题：旧 MSA 格式转换发生在 `infer_predict` 之前，仍然会被 4 个 ranks 重复执行；这主要影响 job time，不影响 forward barrier 后的 model forward profile。
 
@@ -1205,13 +1206,13 @@ benchmarks/bench_c500_collectives.py
 - 这是当前主线，使用单个 4 卡 island。
 - Pairformer 沿 token row 维切分 z-heavy 子图，`PROTENIX_PAIRFORMER_ROW_PARALLEL=1` opt-in，默认只在 `N_token >= 512` 时启用。
 - DiffusionTransformer 使用 Ulysses sequence parallel，`PROTENIX_DIFFUSION_ULYSSES_SP=1` opt-in，配合 rank-local pair-bias cache。
-- rank0 执行旧 MSA 转换、input preprocessing 和 dataloader featurization，再广播 batch 给其他 rank，避免多 rank 重复做 CPU/input 工作。
-- 完整三组默认配置 no-profile run 已跑通：总 job `218.98s`，最大 7wux model forward `130.96s`。
+- 协同推理 `mp_size>1` 时，rank0/MP leader 默认执行旧 MSA 转换、input preprocessing 和 dataloader featurization，再广播 batch 给其他 rank；forward 前 barrier 也默认启用。两者可分别用 `PROTENIX_DISTRIBUTED_DATA_BROADCAST=0` / `PROTENIX_DISTRIBUTED_FORWARD_BARRIER=0` 显式关闭。
+- 当前 4GPU 性能优先配置使用 `--enable_fusion=False`；完整三组默认配置 no-profile run：总 job `157.56s`，最大 7wux model forward `85.79s`。
 
 ### P2：2GPU/4GPU 使用建议
 
-- 2GPU：总 job `252.75s`，7wux forward `162.50s`；卡时性价比更均衡。
-- 4GPU：总 job `218.98s`，7wux forward `130.96s`；适合大 N 或低延迟目标。
+- 2GPU：开启 Diffusion SP 后，7wux-only forward `125.09s`；完整三 case total job 仍需重跑。
+- 4GPU：总 job `157.56s`，7wux forward `85.79s`；适合大 N 或低延迟目标。
 - 8GPU：暂不作为默认路线。8 卡 benchmark 仍有收益，但跨 island gather 从 4 卡约 `2.5ms` 增到约 `6.5ms`，增量收益明显变小。
 
 ### 暂停或废弃方向
@@ -1231,14 +1232,14 @@ benchmarks/bench_c500_collectives.py
 
 2026-07-03 端到端多卡更新：`runner/batch_inference.py` 已增加实验性 rank0-only input preprocessing，复用 `PROTENIX_DISTRIBUTED_DATA_BROADCAST=1` 作为开关。多 rank 下只有 rank0 执行旧 MSA format 转换、`preprocess_input()` 和 dataloader featurization，随后广播 updated JSON 路径与 batch object 给其他 rank。`examples/example_7wux.json` 日志确认旧 MSA 转换只出现一次，rank1/2/3 只接收 `/root/Protenix/examples/example_7wux-update-msa.json`。
 
+2026-07-06 更新：data broadcast 和 forward barrier 在 Pairformer row-parallel 或 Diffusion Ulysses SP 且 `mp_size>1` 时默认自动开启；下面历史命令中的两个显式 env 现在可以省略。若需要调试普通 dataloader 或 barrier 卡住问题，可显式设置 `PROTENIX_DISTRIBUTED_DATA_BROADCAST=0` 或 `PROTENIX_DISTRIBUTED_FORWARD_BARRIER=0`。
+
 同一轮 4GPU reduced end-to-end 使用：
 
 ```bash
 PROTENIX_PAIRFORMER_ROW_PARALLEL=1
 PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512
 PROTENIX_DIFFUSION_ULYSSES_SP=1
-PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1
-PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
 WMMA_VERSION=v9
 --input=examples/example_7wux.json
 --triatt_kernel=wmma
@@ -1328,8 +1329,6 @@ trimul_kernel=torch
 PROTENIX_PAIRFORMER_ROW_PARALLEL=1
 PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512
 PROTENIX_DIFFUSION_ULYSSES_SP=1
-PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1
-PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
 all profile env disabled
 ```
 
@@ -1344,6 +1343,33 @@ all profile env disabled
 - 差距主要来自 7r6r；7wux 和 7pzb 基本持平。
 - 因收益较小，暂不做 `world_size>1 && diffusion_sp=1` 时的代码自动切换，避免隐式改变 Protenix 默认语义。
 - 当前 4GPU SP 性能优先命令建议显式使用 `--enable_fusion=False`。
+
+2026-07-06 auto broadcast/barrier 更新：当 `PROTENIX_PAIRFORMER_ROW_PARALLEL=1` 或 `PROTENIX_DIFFUSION_ULYSSES_SP=1` 且 `mp_size>1` 时，`PROTENIX_DISTRIBUTED_DATA_BROADCAST` 和 `PROTENIX_DISTRIBUTED_FORWARD_BARRIER` 默认自动开启；推荐命令不再需要显式设置这两个 env。若需要调试，可分别设置为 `0` 显式关闭。
+
+验证配置：
+
+```text
+input=examples/example_7wux.json
+cycle=10
+step=200
+sample=5
+triatt_kernel=wmma
+trimul_kernel=torch
+enable_fusion=False
+PROTENIX_PAIRFORMER_ROW_PARALLEL=1
+PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512
+PROTENIX_DIFFUSION_ULYSSES_SP=1
+PROTENIX_DISTRIBUTED_DATA_BROADCAST unset
+PROTENIX_DISTRIBUTED_FORWARD_BARRIER unset
+all profile env disabled
+```
+
+日志确认 non-leader ranks 收到 preprocessed JSON 和 MP-group metadata，说明自动 data broadcast 生效。
+
+| GPUs | rank0 model forward | rank0 job | 说明 |
+|---:|---:|---:|---|
+| 2 | `125.09s` | `141.83s` | 补齐开启 Diffusion SP 后的 2GPU 7wux 数据 |
+| 4 | `86.66s` | `103.04s` | 与前序 4GPU `enable_fusion=False` 7wux `85-87s` 区间一致 |
 
 2026-07-06 1/2/4 卡性价比更新：2GPU/4GPU 配置与 1GPU 相同，只增加协同推理环境变量并把 `torchrun --nproc_per_node` 分别设置为 `2` / `4`。2GPU/4GPU 日志确认 rank0-only MSA/preprocess 和 dataloader broadcast 生效。所有 profile env 均关闭，包括 `PROTENIX_PROFILE_LOG`、`TRIATT_PROFILE_LOG`、`PAIRFORMER_PROFILE_LOG`、`PAIRFORMER_TRIMUL_PROFILE_LOG`、`DIFFUSION_PROFILE_LOG`、`DIFFUSION_TRANSFORMER_PROFILE_LOG`。
 
