@@ -10,7 +10,7 @@
 ## 当前结论
 
 - 当前推荐的多卡推理主线是单个 4 卡 island：Pairformer row-parallel + Diffusion Ulysses SP + MP group leader input preprocessing/data broadcast。
-- 完整三组默认配置上，4GPU 总 job 从单卡约 `343.49s` 降到 `239.38s`，整体约 `1.43x`；最大 7wux case 的 model forward 从约 `250.52s` 降到 `149.05s`，约 `1.68x`。
+- 关闭所有 profile 的默认配置上，4GPU 总 job 为 `218.98s`；最大 7wux case 的 model forward 从单卡 `248.25s` 降到 `130.96s`，约 `1.90x`。
 - 2GPU 在卡时性价比上更均衡，4GPU 更适合大 N 或低延迟目标；8GPU 暂不作为默认目标，因为跨 island gather 收益递减明显。
 - 当前实现支持 DP x MP 组合：`PROTENIX_INFERENCE_MP_SIZE` 控制每个协同推理组的卡数；不设置时默认 `mp_size=world_size`，保持纯 MP 行为。
 - 默认 `N_sample=5` sample parallel 已验证无明显收益，不再推进；Diffusion 继续走 Ulysses sequence parallel，而不是 sample 切分。
@@ -1205,12 +1205,12 @@ benchmarks/bench_c500_collectives.py
 - Pairformer 沿 token row 维切分 z-heavy 子图，`PROTENIX_PAIRFORMER_ROW_PARALLEL=1` opt-in，默认只在 `N_token >= 512` 时启用。
 - DiffusionTransformer 使用 Ulysses sequence parallel，`PROTENIX_DIFFUSION_ULYSSES_SP=1` opt-in，配合 rank-local pair-bias cache。
 - rank0 执行旧 MSA 转换、input preprocessing 和 dataloader featurization，再广播 batch 给其他 rank，避免多 rank 重复做 CPU/input 工作。
-- 完整三组默认配置已跑通：总 job 约 `239.38s`，最大 7wux model forward 约 `149.05s`。
+- 完整三组默认配置 no-profile run 已跑通：总 job `218.98s`，最大 7wux model forward `130.96s`。
 
 ### P2：2GPU/4GPU 使用建议
 
-- 2GPU：总 job 约 `277.28s`，7wux forward 约 `184.06s`；卡时性价比更均衡。
-- 4GPU：总 job 约 `239.38s`，7wux forward 约 `149.05s`；适合大 N 或低延迟目标。
+- 2GPU：总 job `252.75s`，7wux forward `162.50s`；卡时性价比更均衡。
+- 4GPU：总 job `218.98s`，7wux forward `130.96s`；适合大 N 或低延迟目标。
 - 8GPU：暂不作为默认路线。8 卡 benchmark 仍有收益，但跨 island gather 从 4 卡约 `2.5ms` 增到约 `6.5ms`，增量收益明显变小。
 
 ### 暂停或废弃方向
@@ -1270,30 +1270,49 @@ WMMA_VERSION=v9
 
 对比上一版只有 Diffusion Ulysses SP、没有 Pairformer row-parallel 的 `step=40` reduced run，rank0 model forward 从约 `35.15s` 降到 `19.54s`。对比单卡 reduced baseline，`sample_diffusion` 从约 `19.40s` 降到 `6.04s`，约 `3.2x`；`get_pairformer_output` 从约 `16.7s` 降到 `7.44s`，约 `2.25x`。当前 reduced end-to-end 的主要剩余大头变成 confidence/head 相关路径和固定的 CPU/模型加载/featurization wall time。
 
-2026-07-03 完整三组端到端更新：`examples/example.json` 三组经典 case 已在 4GPU 完整默认配置下跑通，配置为 `cycle=10, step=200, sample=5, triatt=wmma, trimul=torch, enable_fusion=True`，并开启 Pairformer row-parallel、Diffusion Ulysses SP、rank0 input preprocessing/dataloader broadcast。日志确认旧 MSA format 转换只在 rank0 出现一次，rank1/2/3 接收 `/root/Protenix/examples/example-update-msa.json`。
+2026-07-06 完整三组端到端 no-profile 更新：`examples/example.json` 三组经典 case 已在 2GPU、4GPU 完整默认配置下跑通；1GPU 在关闭 profile 后 7r6r/7wux 已回到历史水平，但完整三 case 到 7pzb 时仍偶发卡住，判断为 GPU0/连续运行状态问题，不作为 production wall time。配置为 `cycle=10, step=200, sample=5, triatt=wmma, trimul=torch, enable_cache=True, enable_fusion=True`。2GPU/4GPU 开启 Pairformer row-parallel、Diffusion Ulysses SP、rank0 input preprocessing/dataloader broadcast。测试前重启测试容器并 warm reset GPU0-3，避免 GPU0/1 残留上下文影响结果。
 
-| Case | N_token | rank0 model forward | 主要 profile 组成 |
+注意：`PROTENIX_PROFILE_LOG` 会在主模型阶段插入多次 `torch.cuda.synchronize()`，只能用于阶段归因，不能作为 production wall time。正式性能结论使用 no-profile run；profile run 的分阶段数字保留为解释 Pairformer/diffusion 占比。
+
+4GPU no-profile rank0 结果：
+
+| Case | N_token | rank0 model forward |
 |---|---:|---:|---|
-| 7r6r | 245 | `22.20s` | Pairformer `4.69s`, diffusion `16.36s`, confidence `0.60s` |
-| 7wux | 1218 | `149.05s` | Pairformer `68.36s`, diffusion `74.03s`, confidence `4.61s` |
-| 7pzb | 600 | `45.32s` | Pairformer `16.31s`, diffusion `26.53s`, confidence `1.30s` |
+| 7r6r | 245 | `22.96s` |
+| 7wux | 1218 | `130.96s` |
+| 7pzb | 600 | `41.98s` |
 
-整体 rank0 job time 为 `239.38s`。作为对照，之前单卡 v9 三组 `pred` 路径约 `343.49s`，其中 7wux model forward 约 `250.52s`。因此当前 4GPU 多卡路径在完整默认三组上整体约 `1.43x`，在最大 7wux case 的 model forward 上约 `1.68x`。Profile 显示剩余主耗时已经主要分布在 Pairformer 与 diffusion 两块，triangle attention v9 kernel 总体未成为新的异常瓶颈。
+整体 rank0 job time 为 `218.98s`。作为对照，1GPU no-profile 在同一代码下 7r6r/7wux 分别为 `22.99s` / `248.25s`，与历史 `22.82s` / `248.80s` 对齐；单独 7r6r no-profile 为 `22.69s`。因此当前支持多卡后的 world_size=1 路径没有暴露系统性性能退化。Profile run 显示 Pairformer 随卡数下降明显，但 `sample_diffusion` 在完整默认路径里基本维持在 `~74s`，这是端到端加速比不线性的主要原因。
 
-2026-07-03 1/2/4 卡性价比更新：补跑了 2GPU 完整默认三组，配置与 4GPU 相同，只把 `torchrun --nproc_per_node` 改为 `2`。2GPU 日志同样确认 rank0-only MSA/preprocess 和 dataloader broadcast 生效。当前代码单卡补跑到 7pzb 时出现异常长时间运行，只写出了 7r6r/7wux；因此完整单卡三组仍采用之前健康的 seed=101 v9 pred 数据，且本次单卡补跑的 7r6r/7wux 与历史量级一致。
+2026-07-06 1/2/4 卡性价比更新：2GPU/4GPU 配置与 1GPU 相同，只增加协同推理环境变量并把 `torchrun --nproc_per_node` 分别设置为 `2` / `4`。2GPU/4GPU 日志确认 rank0-only MSA/preprocess 和 dataloader broadcast 生效。所有 profile env 均关闭，包括 `PROTENIX_PROFILE_LOG`、`TRIATT_PROFILE_LOG`、`PAIRFORMER_PROFILE_LOG`、`PAIRFORMER_TRIMUL_PROFILE_LOG`、`DIFFUSION_PROFILE_LOG`、`DIFFUSION_TRANSFORMER_PROFILE_LOG`。
 
 | GPUs | Total job | 7r6r forward | 7wux forward | 7pzb forward | Total speedup vs 1GPU | 7wux speedup vs 1GPU |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | `343.49s` | `23.57s` | `250.52s` | `57.84s` | `1.00x` | `1.00x` |
-| 2 | `277.28s` | `22.09s` | `184.06s` | `49.53s` | `1.24x` | `1.36x` |
-| 4 | `239.38s` | `22.20s` | `149.05s` | `45.32s` | `1.43x` | `1.68x` |
+| 1 | n/a | `22.99s` | `248.25s` | n/a | n/a | `1.00x` |
+| 2 | `252.75s` | `22.66s` | `162.50s` | `46.22s` | n/a | `1.53x` |
+| 4 | `218.98s` | `22.96s` | `130.96s` | `41.98s` | n/a | `1.90x` |
+
+1GPU full no-profile run 的 7pzb 在连续三 case 中再次卡在 forward 入口后，GPU0 保持显存占用但无完成日志；相同代码下单独 7pzb no-profile 可完成，forward `61.73s`。因此当前只用 1GPU 的 7r6r/7wux 作为单卡退化判断，用 2GPU/4GPU 完整 job 作为多卡 production 对比。
+
+保留一组带 top-level profile 的阶段归因数据：
+
+关键 profile 对比：
+
+| Case | GPUs | Pairformer / `get_pairformer_output` | `sample_diffusion` | 说明 |
+|---|---:|---:|---:|---|
+| 7wux | 1 | `163.56s` | `74.24s` | 单卡 baseline |
+| 7wux | 2 | `~82.9s` | `~74.0s` | Pairformer 约 `1.97x`，diffusion 基本不降 |
+| 7wux | 4 | `~51.9s` | `~74.0s` | Pairformer 约 `3.15x`，diffusion 仍是主要剩余大头 |
+| 7pzb | 1 | `28.04s` | `26.16s` | 单卡 baseline |
+| 7pzb | 2 | `~18.54s` | `~26.0s` | 中等 N 下 Pairformer 有收益，diffusion 不降 |
+| 7pzb | 4 | `~14.13s` | `~26.0s` | 4GPU 仍有收益，但被 diffusion 固定耗时限制 |
 
 性价比判断：
 
 - 2GPU 相比 1GPU 有稳定收益，但主要来自长序列 7wux；小 N 的 7r6r 几乎没有收益。
-- 4GPU 相比 2GPU 仍有收益，尤其 7wux 从 `184.06s` 降到 `149.05s`，但增量收益已经变小。
+- 4GPU 相比 2GPU 仍有收益，尤其 7wux 从 `162.50s` 降到 `130.96s`，但增量收益已经变小。
 - 如果目标是“单 job 最短延迟”，4GPU 是当前最好选择。
-- 如果目标是“吞吐/卡时性价比”，2GPU 更均衡；4GPU 的总加速比 `1.43x` 低于卡数增长，适合大 N 或延迟敏感场景。
+- 如果目标是“吞吐/卡时性价比”，2GPU 更均衡；4GPU 的完整 job wall time 最短，但卡数增长后的边际收益递减，适合大 N 或延迟敏感场景。
 
 输出一致性检查：
 
