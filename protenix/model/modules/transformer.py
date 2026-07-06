@@ -656,6 +656,44 @@ class DiffusionTransformer(nn.Module):
         self._ulysses_sp_bias_cache[key] = bias
         return bias
 
+    def _ulysses_sp_local_head_bias_fused(
+        self,
+        block_idx: int,
+        z: torch.Tensor,
+        rows: int,
+        world: int,
+        rank: int,
+    ) -> torch.Tensor:
+        block = self.blocks[block_idx]
+        module = block.attention_pair_bias
+        n = z.shape[-1]
+        n_pad = rows * world
+        shard_heads = module.attention.num_heads // world
+        head_start = rank * shard_heads
+        head_end = head_start + shard_heads
+
+        key = self._ulysses_sp_cache_key(block_idx, z, rows, world, rank)
+        cached = self._ulysses_sp_bias_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # Fused diffusion path prepares z as channel-first normalized pair features:
+        # [B, C_z, N, N]. Reuse its 1x1 conv formulation but only for local heads.
+        weight = (
+            module.linear_nobias_z.weight[head_start:head_end]
+            * module.layernorm_z.weight[None, :]
+        )[:, :, None, None]
+        bias = F.conv2d(z, weight).contiguous()
+        if n_pad != n:
+            out = bias.new_zeros(*bias.shape[:-2], n_pad, n_pad)
+            out[..., :n, :n] = bias
+            bias = out
+        max_entries = int(os.environ.get("PROTENIX_DIFFUSION_ULYSSES_SP_CACHE_MAX", "64"))
+        if len(self._ulysses_sp_bias_cache) >= max_entries:
+            self._ulysses_sp_bias_cache.clear()
+        self._ulysses_sp_bias_cache[key] = bias
+        return bias
+
     def _ulysses_sp_project_qkv(self, module: AttentionPairBias, q_x: torch.Tensor):
         attn = module.attention
         q = attn.linear_q(q_x)
@@ -677,6 +715,7 @@ class DiffusionTransformer(nn.Module):
         rows: int,
         world: int,
         rank: int,
+        enable_efficient_fusion: bool,
     ) -> torch.Tensor:
         module = self.blocks[block_idx].attention_pair_bias
         q_x = module.layernorm_a(a=local_a, s=local_s)
@@ -687,7 +726,12 @@ class DiffusionTransformer(nn.Module):
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
-        bias = self._ulysses_sp_local_head_bias(block_idx, z, rows, world, rank)
+        if enable_efficient_fusion:
+            bias = self._ulysses_sp_local_head_bias_fused(
+                block_idx, z, rows, world, rank
+            )
+        else:
+            bias = self._ulysses_sp_local_head_bias(block_idx, z, rows, world, rank)
 
         logits = torch.matmul(q, k.transpose(-1, -2)) + bias
         mask = _sp_valid_key_mask(n, rows * world, logits.device)
@@ -705,6 +749,7 @@ class DiffusionTransformer(nn.Module):
         a: torch.Tensor,
         s: torch.Tensor,
         z: torch.Tensor,
+        enable_efficient_fusion: bool,
     ) -> torch.Tensor:
         inference_parallel = get_inference_parallel_context()
         world = inference_parallel.mp_world_size
@@ -720,7 +765,15 @@ class DiffusionTransformer(nn.Module):
 
         for block_idx, block in enumerate(self.blocks):
             local_attn = self._ulysses_sp_attention(
-                block_idx, local_a, local_s, z, n, rows, world, rank
+                block_idx,
+                local_a,
+                local_s,
+                z,
+                n,
+                rows,
+                world,
+                rank,
+                enable_efficient_fusion,
             )
             local_a = local_attn + local_a
             local_a = block.conditioned_transition_block(a=local_a, s=local_s) + local_a
@@ -761,9 +814,10 @@ class DiffusionTransformer(nn.Module):
             and not torch.is_grad_enabled()
             and n_queries is None
             and n_keys is None
-            and not enable_efficient_fusion
         ):
-            return self._ulysses_sp_forward(a=a, s=s, z=z)
+            return self._ulysses_sp_forward(
+                a=a, s=s, z=z, enable_efficient_fusion=enable_efficient_fusion
+            )
 
         blocks = self._prep_blocks(
             n_queries=n_queries,
