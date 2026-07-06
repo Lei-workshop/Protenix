@@ -11,7 +11,7 @@
 
 - 当前推荐的多卡推理主线是单个 4 卡 island：Pairformer row-parallel + Diffusion Ulysses SP + MP group leader input preprocessing/data broadcast。
 - 关闭所有 profile 的默认配置上，4GPU 总 job 为 `218.98s`；最大 7wux case 的 model forward 从单卡 `248.25s` 降到 `130.96s`，约 `1.90x`。
-- 2026-07-06 更新：Diffusion Ulysses SP 已补齐 `enable_fusion=True` 的 fused pair-bias 路径；7wux reduced `cycle=1, step=40, sample=5` 中，4GPU `sample_diffusion` 从 `19.27s` 降到 `10.34s`。完整默认三 case 仍需基于该新代码重跑后再更新 production wall time。
+- 2026-07-06 更新：Diffusion Ulysses SP 已补齐 `enable_fusion=True` 的 fused pair-bias 路径；完整默认三 case no-profile A/B 显示 `enable_fusion=False` 略优，4GPU 总 job `157.56s`，当前作为 4GPU SP 性能优先推荐配置。
 - 2GPU 在卡时性价比上更均衡，4GPU 更适合大 N 或低延迟目标；8GPU 暂不作为默认目标，因为跨 island gather 收益递减明显。
 - 当前实现支持 DP x MP 组合：`PROTENIX_INFERENCE_MP_SIZE` 控制每个协同推理组的卡数；不设置时默认 `mp_size=world_size`，保持纯 MP 行为。
 - 默认 `N_sample=5` sample parallel 已验证无明显收益，不再推进；Diffusion 继续走 Ulysses sequence parallel，而不是 sample 切分。
@@ -1315,7 +1315,35 @@ PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
 | off | `30.50s` | `48.47s` | `5.86s` | `19.27s` | `29.23s` |
 | on | `21.53s` | `37.62s` | `5.80s` | `10.34s` | `20.28s` |
 
-结论：fused SP 对 `sample_diffusion` 的 reduced 收益约 `1.86x`，并且 Pairformer 时间基本不变，归因清楚。这个收益小于早期 `enable_fusion=False` reduced 路径的约 `3x`，说明默认 fused path 中仍有未并行/固定开销，例如 atom encoder/decoder、sampler loop、confidence 及框架调度。需要下一轮关闭所有 profile 重跑完整默认 `cycle=10, step=200, sample=5` 三 case，才能更新正式 2/4GPU production wall time。
+结论：fused SP 对 `sample_diffusion` 的 reduced 收益约 `1.86x`，并且 Pairformer 时间基本不变，归因清楚。这个收益小于早期 `enable_fusion=False` reduced 路径的约 `3x`，说明默认 fused path 中仍有未并行/固定开销，例如 atom encoder/decoder、sampler loop、confidence 及框架调度。
+
+随后补跑完整默认三 case no-profile A/B，配置均为：
+
+```text
+cycle=10
+step=200
+sample=5
+triatt_kernel=wmma
+trimul_kernel=torch
+PROTENIX_PAIRFORMER_ROW_PARALLEL=1
+PROTENIX_PAIRFORMER_ROW_PARALLEL_MIN_N=512
+PROTENIX_DIFFUSION_ULYSSES_SP=1
+PROTENIX_DISTRIBUTED_FORWARD_BARRIER=1
+PROTENIX_DISTRIBUTED_DATA_BROADCAST=1
+all profile env disabled
+```
+
+| `enable_fusion` | Total job | 7r6r forward | 7wux forward | 7pzb forward |
+|---|---:|---:|---:|---:|
+| `True` | `160.75s` | `21.08s` | `86.02s` | `30.61s` |
+| `False` | `157.56s` | `17.94s` | `85.79s` | `30.58s` |
+
+判断：
+
+- `enable_fusion=False` 在三 case 上没有回退，总 job 比 `True` 快 `3.19s`，约 `2.0%`。
+- 差距主要来自 7r6r；7wux 和 7pzb 基本持平。
+- 因收益较小，暂不做 `world_size>1 && diffusion_sp=1` 时的代码自动切换，避免隐式改变 Protenix 默认语义。
+- 当前 4GPU SP 性能优先命令建议显式使用 `--enable_fusion=False`。
 
 2026-07-06 1/2/4 卡性价比更新：2GPU/4GPU 配置与 1GPU 相同，只增加协同推理环境变量并把 `torchrun --nproc_per_node` 分别设置为 `2` / `4`。2GPU/4GPU 日志确认 rank0-only MSA/preprocess 和 dataloader broadcast 生效。所有 profile env 均关闭，包括 `PROTENIX_PROFILE_LOG`、`TRIATT_PROFILE_LOG`、`PAIRFORMER_PROFILE_LOG`、`PAIRFORMER_TRIMUL_PROFILE_LOG`、`DIFFUSION_PROFILE_LOG`、`DIFFUSION_TRANSFORMER_PROFILE_LOG`。
 
